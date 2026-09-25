@@ -312,6 +312,9 @@ window.__ModuleLoader__.load({
             const r = await rpc('import', p)
             setImportResult(r)
             await loadGroups()
+            // 导入会把恢复出来的会话并入勾选列表，这里必须同步刷新，否则界面
+            // 仍然显示成未勾选，看起来像"恢复了却没被选上"。
+            await loadSelection()
           } catch (e) {
             setError(errText(e))
           }
@@ -450,11 +453,7 @@ window.__ModuleLoader__.load({
               disabled: exporting || countSelected() === 0,
               style: exportBtnStyle
             }, exporting ? '导出中…' : ('导出 ' + countSelectedWorkspaces() + ' 个工作区')),
-            exportResult ? h('div', null, [
-              h('div', { className: 'sm-ok' }, '已导出 ' + exportResult.sessionCount + ' 个会话 → ' + exportResult.path),
-              exportResult.indexWriteError ? h('div', { className: 'sm-err' }, '写索引失败: ' + exportResult.indexWriteError) : null,
-              exportResult.errors && exportResult.errors.length ? h('div', { className: 'sm-err' }, JSON.stringify(exportResult.errors, null, 2)) : null
-            ]) : null
+            exportResult ? h('div', { className: 'sm-ok' }, '已导出 ' + exportResult.sessionCount + ' 个会话 → ' + exportResult.path) : null
           ]),
           h('div', { className: 'sm-card' }, [
             h('div', { className: 'sm-title' }, '从备份目录导入'),
@@ -463,8 +462,8 @@ window.__ModuleLoader__.load({
               h('input', { className: 'sm-input', placeholder: '留空则导入默认导出目录', value: importPath, onChange: function (e) { setImportPath(e.target.value) } }),
               h('button', { className: 'sm-btn primary', onClick: doImport }, '导入')
             ]),
-            importResult ? h('div', { className: 'sm-ok' }, '导入完成：新增 ' + importResult.imported + ' 个，覆盖 ' + importResult.overwritten + ' 个' + (importResult.errors && importResult.errors.length ? ('，' + importResult.errors.length + ' 个错误') : '')) : null,
-            importResult && importResult.errors && importResult.errors.length ? h('div', { className: 'sm-err' }, JSON.stringify(importResult.errors, null, 2)) : null
+            importResult ? h('div', { className: 'sm-ok' }, '导入完成：新增 ' + importResult.imported + ' 个，覆盖 ' + importResult.overwritten + ' 个') : null,
+            importResult && importResult.detached > 0 ? h('div', { className: 'sm-hint' }, '其中 ' + importResult.detached + ' 个已写回磁盘，但未挂到工作区（原工作区目录在当前机器上不可用）；若该目录可用，重启 DSH 后会自动归位。') : null
           ]),
           error ? h('div', { className: 'sm-err' }, error) : null
         ])

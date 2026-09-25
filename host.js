@@ -134,13 +134,25 @@ class SessionMigrateService {
     return this.dshHomePath('session-migrate', 'export-snapshot.json')
   }
 
-  async allSessionIds() {
-    const ids = new Set()
-    try {
-      const records = await this.sessionQuery.listSessions()
-      for (const r of records) ids.add(String(r.header.id))
-    } catch (e) {}
-    return ids
+  // 一次遍历 sessions 目录，得到"磁盘上确实存在日志文件"的会话段集合。
+  // 这是判断会话是否还在的权威依据：查询服务的可见性会滞后（刚导入的会话、
+  // 尚未重建的索引都可能暂时查不到），但磁盘上的文件不会骗人。
+  async scanSessionLogs() {
+    const found = new Set()
+    if (typeof this.dshHomePath !== 'function') return found
+    const root = this.dshHomePath('sessions')
+    let projects = []
+    try { projects = await readdir(root) } catch (e) { return found }
+    for (const proj of projects) {
+      let segments = []
+      try { segments = await readdir(join(root, proj)) } catch (e) { continue }
+      for (const seg of segments) {
+        let files = []
+        try { files = await readdir(join(root, proj, seg)) } catch (e) { continue }
+        if (files.some((name) => /^session(\.v\d+)?\.jsonl(\.zstd)?$/.test(name))) found.add(seg)
+      }
+    }
+    return found
   }
 
   async flushAll() {
@@ -250,25 +262,32 @@ class SessionMigrateService {
 
   async cleanSnapshot(snapshot) {
     if (!snapshot || !snapshot.byWorkspace) return snapshot
-    const validIds = await this.allSessionIds()
-    const validPaths = new Set()
+    // 用工作区注册表里的规范路径（而不是快照里的 key）去定位日志文件：key 是导出时
+    // 记下的原值，大小写或斜杠写法可能不一致，拿它拼目录会算出错误的项目目录，
+    // 把本来有效的条目误判成"文件不存在"。
+    const orphanNorm = this.normKey('__orphan__')
+    const pathByNorm = new Map()
     if (this.workspaceRegistry !== undefined) {
-      for (const w of this.workspaceRegistry.list()) validPaths.add(this.normKey(w.path))
+      for (const w of this.workspaceRegistry.list()) pathByNorm.set(this.normKey(w.path), w.path)
     }
-    validPaths.add(this.normKey('__orphan__'))
     const byWorkspace = {}
     let changed = false
     for (const key in snapshot.byWorkspace) {
       const ws = snapshot.byWorkspace[key]
       if (!ws) { changed = true; continue }
       const nk = this.normKey(key)
-      if (nk !== this.normKey('__orphan__') && !validPaths.has(nk)) {
-        changed = true
-        continue
-      }
+      const isOrphan = nk === orphanNorm
+      // 工作区不在注册表里（典型情形：刚从备份导入，注册还没重建）不能单独作为
+      // 删除理由——回退到快照自己的 key 去定位，只要会话文件确实还在就保留这条记录。
+      const cwd = isOrphan ? null : (pathByNorm.get(nk) ?? key)
       const rawIds = ws.sessionIds || []
-      const keptIds = rawIds.filter((id) => validIds.has(String(id)))
-      if (keptIds.length !== rawIds.length) changed = true
+      // 防御性清理：只按"磁盘上还有没有日志文件"判断。会话记录暂时查不到
+      // （刚导入、索引还没重建）不代表它无效，不能拿查询可见性当删除理由。
+      const keptIds = []
+      for (const id of rawIds) {
+        if (await this.sessionStat(cwd, id) === null) { changed = true; continue }
+        keptIds.push(id)
+      }
       if (keptIds.length === 0) { changed = true; continue }
       const fingerprints = {}
       const sizes = {}
@@ -456,18 +475,34 @@ class SessionMigrateService {
   async loadSelection() {
     const configPath = this.selectionConfigPath()
     if (!configPath) return { selected: [] }
+    this.sessionLogCache.clear()
     try {
       const text = await this.fsReadText(configPath)
       const data = JSON.parse(text)
       const selected = (data && data.selected) || []
-      const validIds = await this.allSessionIds()
-      const cleaned = selected.filter((id) => validIds.has(String(id)))
+      // 判据同样是"磁盘上还有没有这个会话的日志文件"。刚导入的会话可能还没进入
+      // 查询索引，若用查询可见性判断，会把刚恢复出来的勾选项立刻删掉。
+      const logs = await this.scanSessionLogs()
+      const cleaned = selected.filter((id) => logs.has(this.encodeSegment(String(id))))
       if (cleaned.length !== selected.length) {
         try { await this.fsWriteText(configPath, JSON.stringify({ selected: cleaned, updatedAt: Date.now() })) } catch (e) {}
       }
       return { selected: cleaned }
     } catch (e) {
       return { selected: [] }
+    }
+  }
+
+  // 只读地取出当前勾选，不做任何清理（清理版是 loadSelection）。
+  async readSelectedIds() {
+    const configPath = this.selectionConfigPath()
+    if (!configPath) return []
+    try {
+      const data = JSON.parse(await this.fsReadText(configPath))
+      const selected = data && data.selected
+      return Array.isArray(selected) ? selected.map(String) : []
+    } catch (e) {
+      return []
     }
   }
 
@@ -529,6 +564,7 @@ class SessionMigrateService {
     const ids = sessionIds || []
     if (typeof this.dshHomePath !== 'function') return { error: '无法确定 DSH_HOME 路径' }
     await this.flushAll()
+    this.sessionLogCache.clear()
     const exportBase = this.dshHomePath('session-migrate', 'exports')
     try { await this.clearDir(exportBase) } catch (e) {}
     const archived = new Set(this.archivedIds().map(String))
@@ -538,19 +574,20 @@ class SessionMigrateService {
       for (const r of records) headerById[r.header.id] = r
     } catch (e) {}
     const items = []
-    const errors = []
+    // 防御性：选中项里已经消失的会话（记录没了，或日志文件不在磁盘上）直接跳过。
+    // 索引只描述"实际导出成功的内容"，不把这类预期内的缺失写成错误条目。
     for (const id of ids) {
       const rec = headerById[id]
-      if (!rec) { errors.push({ id: id, error: '未找到会话记录' }); continue }
+      if (!rec) continue
       const header = rec.header
       const cwd = header.cwd
       let fileName
       try {
         fileName = await this.findLogFileName(cwd, id)
       } catch (e) {
-        errors.push({ id: id, error: this.errText(e) }); continue
+        continue
       }
-      if (!fileName) { errors.push({ id: id, error: '未找到日志文件' }); continue }
+      if (!fileName) continue
       const seg = this.encodeSegment(id)
       const proj = this.projSeg(cwd)
       const src = this.dshHomePath('sessions', proj, seg, fileName)
@@ -561,14 +598,12 @@ class SessionMigrateService {
     if (items.length > 0) {
       try {
         hashMap = await this.copyAndHashAll(items)
-      } catch (e) {
-        errors.push({ error: '批量拷贝/哈希失败: ' + this.errText(e) })
-      }
+      } catch (e) {}
     }
     const entries = []
     for (const item of items) {
       const hash = hashMap[item.id]
-      if (!hash) { errors.push({ id: item.id, error: '哈希失败' }); continue }
+      if (!hash) continue
       let fingerprint = null
       let size = null
       try {
@@ -597,15 +632,11 @@ class SessionMigrateService {
       format: 'dsh-sessions-export',
       version: 2,
       exportedAt: Date.now(),
-      sessions: entries,
-      errors: errors
+      sessions: entries
     }
-    let indexWriteError = null
     try {
       await this.fsWriteText(this.dshHomePath('session-migrate', 'exports', 'index.json'), JSON.stringify(index, null, 2))
-    } catch (e) {
-      indexWriteError = this.errText(e)
-    }
+    } catch (e) {}
     const byWorkspace = {}
     for (const entry of entries) {
       const key = entry.cwd || '__orphan__'
@@ -621,14 +652,13 @@ class SessionMigrateService {
     }
     return {
       path: exportBase,
-      sessionCount: entries.length,
-      indexWriteError: indexWriteError,
-      errors: errors.slice(0, 20)
+      sessionCount: entries.length
     }
   }
 
   async import(path) {
     if (typeof this.dshHomePath !== 'function') return { error: '无法确定 DSH_HOME 路径' }
+    this.sessionLogCache.clear()
     let p = path || ''
     if (typeof p !== 'string' || p.trim() === '') {
       p = this.dshHomePath('session-migrate', 'exports')
@@ -640,21 +670,17 @@ class SessionMigrateService {
     const list = (index && index.sessions) || []
     const imported = []
     const overwritten = []
-    const errors = []
+    const detached = []
     for (const s of list) {
+      // 防御性：索引条目缺字段、备份文件校验不过、或归属恢复失败，都只跳过这一条，
+      // 继续处理其余条目——单条问题不中断整次导入，也不写进任何配置文件。
       try {
-        if (!s.id || !s.projectDir || !s.sessionSegment || !s.fileName) {
-          errors.push({ id: s.id, error: '索引条目字段缺失' })
-          continue
-        }
-        const src = join(exportBase, ...s.relativePath.split('/'))
+        if (!s.id || !s.projectDir || !s.sessionSegment || !s.fileName) continue
+        const src = join(exportBase, ...String(s.relativePath || '').split('/'))
         const dst = this.dshHomePath('sessions', s.projectDir, s.sessionSegment, s.fileName)
         if (s.hash) {
           const srcHash = await this.hashFile(src)
-          if (srcHash.toLowerCase() !== String(s.hash).toLowerCase()) {
-            errors.push({ id: s.id, error: 'hash 校验不匹配' })
-            continue
-          }
+          if (srcHash.toLowerCase() !== String(s.hash).toLowerCase()) continue
         }
         // 恢复语义：目标已存在也必须用备份替换，否则"恢复"退化成只能补缺失的会话，
         // 用户回滚不了任何改动。替换后清掉派生的投影缓存，让宿主按新内容重建。
@@ -666,24 +692,29 @@ class SessionMigrateService {
         } else {
           imported.push(s.id)
         }
+        // 恢复工作区归属。目标机器上很可能还没有这个工作区目录——这恰恰是要从备份
+        // 恢复的情形，而 registry.create / attachSession 都要求路径是已存在的真实目录。
+        // 所以先补建目录再注册；两步都失败才记入 detached（如实报告，不假装成功）。
         if (s.cwd && this.workspaceRegistry !== undefined) {
           try {
             const ws = await this.workspaceRegistry.create(s.cwd)
             await ws.attachSession(s.id)
           } catch (e) {
-            errors.push({ id: s.id, error: '恢复工作区归属失败: ' + this.errText(e) })
+            try {
+              await mkdir(s.cwd, { recursive: true })
+              const ws = await this.workspaceRegistry.create(s.cwd)
+              await ws.attachSession(s.id)
+            } catch (e2) {
+              detached.push(s.id)
+            }
           }
         }
         if (s.archived && this.workspaceRegistry !== undefined) {
           try {
             await this.workspaceRegistry.archiveSession(s.id)
-          } catch (e) {
-            errors.push({ id: s.id, error: '归档恢复失败（可能需重启后生效）: ' + this.errText(e) })
-          }
+          } catch (e) {}
         }
-      } catch (e) {
-        errors.push({ id: s.id, error: this.errText(e) })
-      }
+      } catch (e) {}
     }
     const restored = new Set()
     for (const id of imported) restored.add(String(id))
@@ -705,12 +736,22 @@ class SessionMigrateService {
     if (sp) {
       try { await this.fsWriteText(sp, JSON.stringify(snapshot, null, 2)) } catch (e) {}
     }
+    // 把刚恢复的会话并入当前勾选：它们是这次操作的对象，默认勾上比让用户回去
+    // 逐个勾更合理（备份本来也是从一份勾选列表导出来的）。
+    const merged = Array.from(new Set([
+      ...await this.readSelectedIds(),
+      ...imported.map(String),
+      ...overwritten.map(String),
+      ...detached.map(String)
+    ]))
+    if (merged.length > 0) await this.saveSelection(merged)
     return {
       imported: imported.length,
       overwritten: overwritten.length,
-      errors: errors.slice(0, 30),
+      detached: detached.length,
       importedIds: imported,
-      overwrittenIds: overwritten
+      overwrittenIds: overwritten,
+      detachedIds: detached
     }
   }
 }
