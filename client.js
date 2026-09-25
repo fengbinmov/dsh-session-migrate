@@ -458,11 +458,12 @@ window.__ModuleLoader__.load({
           ]),
           h('div', { className: 'sm-card' }, [
             h('div', { className: 'sm-title' }, '从备份目录导入'),
+            h('p', { className: 'sm-hint', style: { margin: 0 } }, '备份会覆盖相同会话的现有数据（即回滚到导出时的状态）。'),
             h('div', { className: 'sm-row' }, [
               h('input', { className: 'sm-input', placeholder: '留空则导入默认导出目录', value: importPath, onChange: function (e) { setImportPath(e.target.value) } }),
               h('button', { className: 'sm-btn primary', onClick: doImport }, '导入')
             ]),
-            importResult ? h('div', { className: 'sm-ok' }, '导入 ' + importResult.imported + ' 个，跳过 ' + importResult.skipped + ' 个' + (importResult.errors && importResult.errors.length ? ('，' + importResult.errors.length + ' 个错误') : '')) : null,
+            importResult ? h('div', { className: 'sm-ok' }, '导入完成：新增 ' + importResult.imported + ' 个，覆盖 ' + importResult.overwritten + ' 个' + (importResult.errors && importResult.errors.length ? ('，' + importResult.errors.length + ' 个错误') : '')) : null,
             importResult && importResult.errors && importResult.errors.length ? h('div', { className: 'sm-err' }, JSON.stringify(importResult.errors, null, 2)) : null
           ]),
           error ? h('div', { className: 'sm-err' }, error) : null

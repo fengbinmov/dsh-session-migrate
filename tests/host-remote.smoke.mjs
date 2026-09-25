@@ -29,6 +29,9 @@ assert.deepEqual(
 )
 
 // 最小 Context 替身：服务现在直接按 Cordis 契约注册，只需 reflect.provide 与 get。
+// dshHomePath 是 import/export 的根锚点，这里指向工作区内的临时目录。
+const homeDir = join(here, '.tmp-home')
+rmSync(homeDir, { recursive: true, force: true })
 const provided = new Map()
 const ctx = {
   reflect: {
@@ -39,7 +42,7 @@ const ctx = {
       }
     }
   },
-  get: () => undefined
+  get: (key) => (key === 'dshHomePath' ? (...segments) => join(homeDir, ...segments) : undefined)
 }
 await apply(ctx)
 
@@ -96,4 +99,49 @@ assert.equal(await service.fsExists(probe), false, 'clearDir 应删除普通条�
 await service.removePath(workDir)
 assert.equal(await service.fsExists(workDir), false)
 
-console.log('host 装配冒烟测试通过：服务注册、字符串键标记、文件层契约均符合宿主要求。')
+// ── 导入必须覆盖已存在的会话 ──────────────────────────────────────────────────
+// 回归：import 曾经写的是"目标已存在就 skipped"，于是"恢复"退化成只能补缺失的会话，
+// 用户回滚不了任何改动（本机实测：加了新对话再导入，session.v3.jsonl.zstd 根本没被替换）。
+const backupRelative = 'sessions/_no-cwd/session-probe-0002/session.v3.jsonl.zstd'
+const exportDir = join(homeDir, 'session-migrate', 'exports')
+const backupFile = join(exportDir, ...backupRelative.split('/'))
+await service.writeTextEnsured(backupFile, 'BACKUP-V1')
+const backupHash = await service.hashFile(backupFile)
+await service.writeTextEnsured(join(exportDir, 'index.json'), JSON.stringify({
+  format: 'dsh-sessions-export',
+  version: 2,
+  exportedAt: 1,
+  errors: [],
+  sessions: [{
+    id: 'session-probe-0002',
+    cwd: null,
+    projectDir: '_no-cwd',
+    sessionSegment: 'session-probe-0002',
+    fileName: 'session.v3.jsonl.zstd',
+    relativePath: backupRelative,
+    hash: backupHash,
+    fingerprint: null,
+    size: null,
+    archived: false
+  }]
+}))
+
+// 现场：同 id 的会话已被改动（内容与备份不同）
+const liveFile = join(homeDir, 'sessions', '_no-cwd', 'session-probe-0002', 'session.v3.jsonl.zstd')
+await service.writeTextEnsured(liveFile, 'LIVE-V2')
+assert.equal(await service.fsReadText(liveFile), 'LIVE-V2')
+
+const importResult = await service.import(exportDir)
+assert.deepEqual(importResult.errors, [], '导入不应报错')
+assert.equal(importResult.imported, 0, '已存在的会话不计入新增')
+assert.equal(importResult.overwritten, 1, '已存在的会话必须被覆盖')
+assert.equal(await service.fsReadText(liveFile), 'BACKUP-V1', '导入后本地内容必须回到备份版本')
+
+// 再导入一次：此时目标已等于备份，仍应记为覆盖（语义是"以备份为准"，不是"只补缺失"）。
+const second = await service.import(exportDir)
+assert.equal(second.overwritten, 1)
+assert.equal(await service.fsReadText(liveFile), 'BACKUP-V1')
+
+rmSync(homeDir, { recursive: true, force: true })
+
+console.log('host 装配冒烟测试通过：服务注册、字符串键标记、文件层契约、导入覆盖语义均符合宿主要求。')

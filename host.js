@@ -639,7 +639,7 @@ class SessionMigrateService {
     const exportBase = dirname(base)
     const list = (index && index.sessions) || []
     const imported = []
-    const skipped = []
+    const overwritten = []
     const errors = []
     for (const s of list) {
       try {
@@ -649,18 +649,22 @@ class SessionMigrateService {
         }
         const src = join(exportBase, ...s.relativePath.split('/'))
         const dst = this.dshHomePath('sessions', s.projectDir, s.sessionSegment, s.fileName)
-        const exists = await this.fsExists(dst)
-        if (!exists) {
-          if (s.hash) {
-            const srcHash = await this.hashFile(src)
-            if (srcHash.toLowerCase() !== String(s.hash).toLowerCase()) {
-              errors.push({ id: s.id, error: 'hash 校验不匹配' })
-              continue
-            }
+        if (s.hash) {
+          const srcHash = await this.hashFile(src)
+          if (srcHash.toLowerCase() !== String(s.hash).toLowerCase()) {
+            errors.push({ id: s.id, error: 'hash 校验不匹配' })
+            continue
           }
-          await this.copyFileEnsured(src, dst)
+        }
+        // 恢复语义：目标已存在也必须用备份替换，否则"恢复"退化成只能补缺失的会话，
+        // 用户回滚不了任何改动。替换后清掉派生的投影缓存，让宿主按新内容重建。
+        const exists = await this.fsExists(dst)
+        await this.copyFileEnsured(src, dst)
+        if (exists) {
+          overwritten.push(s.id)
+          try { await this.removePath(this.dshHomePath('storages', 'session_projcache', 'sessions', s.id + '.json')) } catch (e) {}
         } else {
-          skipped.push(s.id)
+          imported.push(s.id)
         }
         if (s.cwd && this.workspaceRegistry !== undefined) {
           try {
@@ -677,14 +681,13 @@ class SessionMigrateService {
             errors.push({ id: s.id, error: '归档恢复失败（可能需重启后生效）: ' + this.errText(e) })
           }
         }
-        imported.push(s.id)
       } catch (e) {
         errors.push({ id: s.id, error: this.errText(e) })
       }
     }
     const restored = new Set()
     for (const id of imported) restored.add(String(id))
-    for (const id of skipped) restored.add(String(id))
+    for (const id of overwritten) restored.add(String(id))
     const byWorkspace = {}
     for (const s of list) {
       if (!restored.has(String(s.id))) continue
@@ -704,10 +707,10 @@ class SessionMigrateService {
     }
     return {
       imported: imported.length,
-      skipped: skipped.length,
+      overwritten: overwritten.length,
       errors: errors.slice(0, 30),
       importedIds: imported,
-      skippedIds: skipped
+      overwrittenIds: overwritten
     }
   }
 }
