@@ -1,16 +1,17 @@
-import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { createHash } from 'node:crypto'
+import { copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 
 export const name = 'session-migrate'
 
-export const inject = ['sessionQuery', 'fs', 'shell', 'workspaceRegistry', 'sandboxPolicy']
+// 文件操作全部走 node:fs，因此不再需要 fs / shell / sandboxPolicy 三个宿主服务：
+// 这套实现跨平台（Windows 与 macOS 行为一致），也没有 PowerShell 的进程启动开销。
+export const inject = ['sessionQuery', 'workspaceRegistry']
 
 const REMOTE_METHODS = ['listGroups', 'listSessions', 'loadSelection', 'saveSelection', 'unarchive', 'deleteWorkspace', 'export', 'import']
 
 // 宿主 gateway 发现“源码模式”远程端点的唯一依据，是服务原型上这个稳定字符串键
 // 描述符——新版协议改用原型属性，正是为了让另一个已安装副本也能读到。
-// 但本包 import 解析到的 typert-protocol 副本是 0.1.0-rc.6，它把标记存进模块私有
-// 的 WeakMap，宿主（0.1.5-rc.3）读不到，端点就会以 HTTP 404 收场。因此这里按新
-// 约定手工补一份描述符，同时保留下面的 Remote() 调用以兼容旧宿主。
 const REMOTE_METHODS_KEY = '@deepseek-ai/dsh-typert-protocol/remote-methods'
 
 function markRemoteMethod(prototype, method) {
@@ -26,37 +27,54 @@ function markRemoteMethod(prototype, method) {
   })
 }
 
-class SessionMigrateService extends TypertRemoteService {
-  constructor(ctx) {
-    super(ctx, 'sessionMigrate', { namespace: 'sessionMigrate' })
-    this.ctx = ctx
-    this.sessionQuery = ctx.get('sessionQuery')
-    this.fs = ctx.get('fs')
-    this.shell = ctx.get('shell')
-    this.workspaceRegistry = ctx.get('workspaceRegistry')
-    this.sandboxPolicy = ctx.get('sandboxPolicy')
-    this.dshHomePath = ctx.get('dshHomePath')
-    this.sessionPersistence = ctx.get('sessionPersistence')
-    const instance = this
+// typert-protocol ≤ 0.1.0 把标记存进模块私有的 WeakMap，跨副本无法手工写入，只能借它
+// 的 Remote() 打点；新版写的正是上面那个字符串键（幂等，重复打点会被忽略）。
+// 该说明符可能解析到任意版本、也可能根本不存在，所以整体是 best-effort：失败不影响新宿主。
+async function markLegacyRemote(instance) {
+  let protocol
+  try {
+    protocol = await import('@deepseek-ai/dsh-typert-protocol')
+  } catch (e) {
+    return
+  }
+  const legacyRemote = protocol && protocol.Remote
+  if (typeof legacyRemote !== 'function') return
+  try {
     for (const method of REMOTE_METHODS) {
-      Remote(method)(null, {
+      legacyRemote(method)(null, {
         name: method,
         private: false,
         static: false,
         addInitializer: (initializer) => initializer.call(instance)
       })
-      markRemoteMethod(SessionMigrateService.prototype, method)
     }
+  } catch (e) {}
+}
+
+// 直接按 Cordis 契约注册服务（reflect.provide 的生命周期绑定当前 fiber，插件卸载时自动
+// 注销），不继承任何第三方基类——于是不再依赖被别的插件提升上来的 typert-protocol 副本，
+// 从根上消除版本劫持。
+class SessionMigrateService {
+  constructor(ctx) {
+    this.name = 'sessionMigrate'
+    this.ctx = ctx
+    this.sessionQuery = ctx.get('sessionQuery')
+    this.workspaceRegistry = ctx.get('workspaceRegistry')
+    this.dshHomePath = ctx.get('dshHomePath')
+    this.sessionPersistence = ctx.get('sessionPersistence')
+    this.sessionLogCache = new Map()
+    this.typertRemote = Object.freeze({
+      service: this,
+      serviceKey: 'sessionMigrate',
+      namespace: 'sessionMigrate'
+    })
+    for (const method of REMOTE_METHODS) markRemoteMethod(SessionMigrateService.prototype, method)
+    ctx.reflect.provide('sessionMigrate', this, undefined)
   }
 
   errText(e) {
     if (e && e.message) return e.message
     return String(e)
-  }
-
-  fullAccessPolicy() {
-    if (this.sandboxPolicy === undefined) return undefined
-    return this.sandboxPolicy.resolve({ mode: 'danger-full-access' })
   }
 
   projectKey(cwd) {
@@ -102,10 +120,6 @@ class SessionMigrateService extends TypertRemoteService {
     return String(p || '').replace(/\\/g, '/').toLowerCase()
   }
 
-  psQuote(s) {
-    return "'" + String(s).replace(/'/g, "''") + "'"
-  }
-
   archivedIds() {
     try {
       if (this.workspaceRegistry !== undefined && this.workspaceRegistry.archivedSessionIds) {
@@ -135,66 +149,75 @@ class SessionMigrateService extends TypertRemoteService {
     }
   }
 
-  async shellRun(cmd) {
-    if (this.shell === undefined) throw new Error('shell 服务不可用')
-    const spec = this.shell.resolve({ command: cmd, sandboxPolicy: this.fullAccessPolicy() })
-    const r = await this.shell.run(spec)
-    if (r.exitCode !== 0) {
-      throw new Error((r.stderr && r.stderr.text ? r.stderr.text.trim() : '') || ('exit ' + r.exitCode))
-    }
-    return (r.stdout && r.stdout.text) || ''
+  // ── 文件操作（node:fs，跨平台） ─────────────────────────────────────────────
+  // sha256 十六进制大写，与旧 PowerShell Get-FileHash 输出同形，因此已有的
+  // exports/index.json 与快照哈希可以直接比较。
+  async hashFile(path) {
+    return createHash('sha256').update(await readFile(path)).digest('hex').toUpperCase()
   }
 
-  async shellClearDir(path) {
-    const cmd = 'if (Test-Path -LiteralPath ' + this.psQuote(path) + ') { Get-ChildItem -LiteralPath ' + this.psQuote(path) + ' -Force | Where-Object { $_.Name -notlike ' + this.psQuote('.*') + ' } | Remove-Item -Recurse -Force }'
-    await this.shellRun(cmd)
+  // 复刻宿主 fs 服务的 version 语义（dsh-fs-local 的 versionOf）：同一文件内容未变时
+  // 给出同一个版本串，变了就变——这样已有 export-snapshot.json 里的 fingerprints 不会失效。
+  async fileVersion(path) {
+    const info = await stat(path, { bigint: true })
+    return {
+      version: info.dev + ':' + info.ino + ':' + info.size + ':' + info.mtimeNs + ':' + info.ctimeNs,
+      size: Number(info.size)
+    }
   }
 
-  async shellRemovePath(path) {
-    const cmd = 'if (Test-Path -LiteralPath ' + this.psQuote(path) + ') { Remove-Item -Recurse -Force -LiteralPath ' + this.psQuote(path) + ' }'
-    await this.shellRun(cmd)
+  async copyFileEnsured(src, dst) {
+    await mkdir(dirname(dst), { recursive: true })
+    await copyFile(src, dst)
   }
 
-  async shellBatchCopyHash(items) {
-    const lines = []
-    for (const item of items) {
-      lines.push('New-Item -ItemType Directory -Force -Path (Split-Path -Parent ' + this.psQuote(item.dst) + ') | Out-Null')
-      lines.push('Copy-Item -LiteralPath ' + this.psQuote(item.src) + ' -Destination ' + this.psQuote(item.dst) + ' -Force')
-    }
-    lines.push('$results = @{}')
-    for (const item of items) {
-      lines.push('$results[' + this.psQuote(item.id) + '] = (Get-FileHash -LiteralPath ' + this.psQuote(item.src) + ' -Algorithm SHA256).Hash')
-    }
-    lines.push('$results | ConvertTo-Json -Compress')
-    const cmd = lines.join('; ')
-    const out = await this.shellRun(cmd)
+  async copyAndHashAll(items) {
+    const hashes = {}
+    await Promise.all(items.map(async (item) => {
+      await this.copyFileEnsured(item.src, item.dst)
+      hashes[item.id] = await this.hashFile(item.src)
+    }))
+    return hashes
+  }
+
+  async removePath(path) {
+    await rm(path, { recursive: true, force: true })
+  }
+
+  // 与原 PowerShell 实现同语义：只清空非隐藏条目，保留点文件。
+  async clearDir(path) {
+    let entries
     try {
-      const parsed = JSON.parse(out)
-      return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {}
+      entries = await readdir(path, { withFileTypes: true })
     } catch (e) {
-      return {}
+      return
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue
+      await rm(join(path, entry.name), { recursive: true, force: true })
     }
   }
 
-  async shellHash(path) {
-    const out = await this.shellRun('(Get-FileHash -LiteralPath ' + this.psQuote(path) + ' -Algorithm SHA256).Hash')
-    return out.trim()
+  async writeTextEnsured(path, content) {
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, content, 'utf8')
   }
 
-  async shellCopy(src, dst) {
-    const cmd = 'New-Item -ItemType Directory -Force -Path (Split-Path -Parent ' + this.psQuote(dst) + ') | Out-Null; Copy-Item -LiteralPath ' + this.psQuote(src) + ' -Destination ' + this.psQuote(dst) + ' -Force'
-    await this.shellRun(cmd)
-  }
-
+  // 每次请求内按目录缓存一次 readdir：列表页会为每个工作区 × 每个会话查询日志名，
+  // 缓存把 N×M 次目录扫描压成每个会话目录一次。
   async findLogFileName(cwd, id) {
     if (typeof this.dshHomePath !== 'function') return undefined
     const dir = this.dshHomePath('sessions', this.projSeg(cwd), this.encodeSegment(id))
-    const target = await this.fs.resolve(dir)
-    const entries = await this.fs.listDir(target)
-    for (const e of entries) {
-      if (e.type === 'file' && /^session(\.v\d+)?\.jsonl(\.zstd)?$/.test(e.name)) return e.name
+    if (this.sessionLogCache.has(dir)) return this.sessionLogCache.get(dir)
+    let fileName
+    try {
+      const entries = await readdir(dir)
+      fileName = entries.find((name) => /^session(\.v\d+)?\.jsonl(\.zstd)?$/.test(name))
+    } catch (e) {
+      fileName = undefined
     }
-    return undefined
+    this.sessionLogCache.set(dir, fileName)
+    return fileName
   }
 
   async sessionStat(cwd, id) {
@@ -202,29 +225,24 @@ class SessionMigrateService extends TypertRemoteService {
       const fileName = await this.findLogFileName(cwd, id)
       if (!fileName) return null
       const path = this.dshHomePath('sessions', this.projSeg(cwd), this.encodeSegment(id), fileName)
-      const target = await this.fs.resolve(path)
-      const info = await this.fs.stat(target)
-      if (!info) return null
-      return { version: info.version, size: info.size || 0 }
+      return await this.fileVersion(path)
     } catch (e) {
       return null
     }
   }
 
   async fsWriteText(path, content) {
-    const target = await this.fs.resolve(path)
-    await this.fs.writeText(target, content, undefined, undefined, this.fullAccessPolicy())
+    await this.writeTextEnsured(path, content)
   }
 
   async fsReadText(path) {
-    const target = await this.fs.resolve(path)
-    return await this.fs.readText(target)
+    return await readFile(path, 'utf8')
   }
 
   async fsExists(path) {
     try {
-      const target = await this.fs.resolve(path)
-      return (await this.fs.stat(target)) !== undefined
+      await stat(path)
+      return true
     } catch (e) {
       return false
     }
@@ -303,6 +321,7 @@ class SessionMigrateService extends TypertRemoteService {
 
   async listGroups() {
     await this.flushAll()
+    this.sessionLogCache.clear()
     const snapshot = await this.readSnapshot()
     const byWorkspace = (snapshot && snapshot.byWorkspace) || {}
     const normByWorkspace = {}
@@ -372,6 +391,7 @@ class SessionMigrateService extends TypertRemoteService {
 
   async listSessions(cwd) {
     await this.flushAll()
+    this.sessionLogCache.clear()
     const cwdValue = (cwd == null) ? null : cwd
     let records
     try {
@@ -487,7 +507,6 @@ class SessionMigrateService extends TypertRemoteService {
   async deleteWorkspace(path) {
     if (!path) return { error: '缺少工作区路径' }
     if (typeof this.dshHomePath !== 'function') return { error: '无法确定 DSH_HOME 路径' }
-    if (this.shell === undefined) return { error: 'shell 服务不可用' }
     if (this.workspaceRegistry === undefined) return { error: 'workspaceRegistry 服务不可用' }
     let targetWs = null
     for (const w of this.workspaceRegistry.list()) {
@@ -497,10 +516,10 @@ class SessionMigrateService extends TypertRemoteService {
     const sessionIds = Array.from(targetWs.sessionIds).map(String)
     const proj = this.projSeg(targetWs.path)
     const projectDir = this.dshHomePath('sessions', proj)
-    try { await this.shellRemovePath(projectDir) } catch (e) {}
+    try { await this.removePath(projectDir) } catch (e) {}
     for (const id of sessionIds) {
       const cachePath = this.dshHomePath('storages', 'session_projcache', 'sessions', id + '.json')
-      try { await this.shellRemovePath(cachePath) } catch (e) {}
+      try { await this.removePath(cachePath) } catch (e) {}
     }
     try { await this.workspaceRegistry.delete(targetWs.id) } catch (e) {}
     return { ok: true, deletedSessions: sessionIds.length }
@@ -509,10 +528,9 @@ class SessionMigrateService extends TypertRemoteService {
   async export(sessionIds) {
     const ids = sessionIds || []
     if (typeof this.dshHomePath !== 'function') return { error: '无法确定 DSH_HOME 路径' }
-    if (this.shell === undefined) return { error: 'shell 服务不可用' }
     await this.flushAll()
     const exportBase = this.dshHomePath('session-migrate', 'exports')
-    try { await this.shellClearDir(exportBase) } catch (e) {}
+    try { await this.clearDir(exportBase) } catch (e) {}
     const archived = new Set(this.archivedIds().map(String))
     const headerById = {}
     try {
@@ -542,7 +560,7 @@ class SessionMigrateService extends TypertRemoteService {
     let hashMap = {}
     if (items.length > 0) {
       try {
-        hashMap = await this.shellBatchCopyHash(items)
+        hashMap = await this.copyAndHashAll(items)
       } catch (e) {
         errors.push({ error: '批量拷贝/哈希失败: ' + this.errText(e) })
       }
@@ -554,10 +572,9 @@ class SessionMigrateService extends TypertRemoteService {
       let fingerprint = null
       let size = null
       try {
-        const srcTarget = await this.fs.resolve(item.src)
-        const info = await this.fs.stat(srcTarget)
-        fingerprint = info ? info.version : null
-        size = info ? (info.size || 0) : null
+        const info = await this.fileVersion(item.src)
+        fingerprint = info.version
+        size = info.size
       } catch (e) {}
       entries.push({
         id: item.id,
@@ -612,15 +629,14 @@ class SessionMigrateService extends TypertRemoteService {
 
   async import(path) {
     if (typeof this.dshHomePath !== 'function') return { error: '无法确定 DSH_HOME 路径' }
-    if (this.shell === undefined) return { error: 'shell 服务不可用，无法拷贝文件' }
     let p = path || ''
     if (typeof p !== 'string' || p.trim() === '') {
       p = this.dshHomePath('session-migrate', 'exports')
     }
     let base = String(p).replace(/[\\/]+$/, '')
-    if (!/index\.json$/.test(base)) base = base + '\\index.json'
+    if (!/index\.json$/.test(base)) base = join(base, 'index.json')
     const index = JSON.parse(await this.fsReadText(base))
-    const exportBase = base.replace(/index\.json$/, '')
+    const exportBase = dirname(base)
     const list = (index && index.sessions) || []
     const imported = []
     const skipped = []
@@ -631,18 +647,18 @@ class SessionMigrateService extends TypertRemoteService {
           errors.push({ id: s.id, error: '索引条目字段缺失' })
           continue
         }
-        const src = exportBase + s.relativePath.replace(/\//g, '\\')
+        const src = join(exportBase, ...s.relativePath.split('/'))
         const dst = this.dshHomePath('sessions', s.projectDir, s.sessionSegment, s.fileName)
         const exists = await this.fsExists(dst)
         if (!exists) {
           if (s.hash) {
-            const srcHash = await this.shellHash(src)
+            const srcHash = await this.hashFile(src)
             if (srcHash.toLowerCase() !== String(s.hash).toLowerCase()) {
               errors.push({ id: s.id, error: 'hash 校验不匹配' })
               continue
             }
           }
-          await this.shellCopy(src, dst)
+          await this.copyFileEnsured(src, dst)
         } else {
           skipped.push(s.id)
         }
@@ -696,6 +712,7 @@ class SessionMigrateService extends TypertRemoteService {
   }
 }
 
-export function apply(ctx) {
-  new SessionMigrateService(ctx)
+export async function apply(ctx) {
+  const service = new SessionMigrateService(ctx)
+  await markLegacyRemote(service)
 }

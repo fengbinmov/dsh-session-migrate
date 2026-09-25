@@ -1,12 +1,18 @@
-// host.js 装配冒烟测试：验证 host 半边在当前 typert-protocol 版本下确实注册了
-// sessionMigrate 服务，并且 Remote 装饰器 shim 在原型上留下了完整的 direct 标记。
+// host.js 装配冒烟测试。
 //
-// 回归目标：host.js 用 `Remote(method)(null, {...})` 手工模拟 stage-3 装饰器。
-// 协议包升级后若描述符版本或校验规则变化，标记会静默丢失，客户端就会看到
-// 一个没有方法的命名空间。
+// 固定两条契约：
+//   1. 远程端点：服务必须注册，且按宿主 gateway 读取的稳定字符串键写入完整 direct 标记
+//      （写不进这个键，gateway 的 collectSrcClaims 就找不到端点，客户端拿到 HTTP 404）。
+//   2. 文件层：fingerprint 必须与宿主 fs 服务的 versionOf 同形
+//      （dev:ino:size:mtimeNs:ctimeNs），hash 必须是 sha256 大写十六进制——否则已有的
+//      export-snapshot.json 会全部失配，旧备份的哈希校验也会失败。
 import assert from 'node:assert/strict'
-import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol'
+import { writeFileSync, rmSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { apply, inject, name } from '../host.js'
+
+const here = dirname(fileURLToPath(import.meta.url))
 
 assert.equal(name, 'session-migrate')
 
@@ -15,47 +21,36 @@ const expectedMethods = [
   'unarchive', 'deleteWorkspace', 'export', 'import'
 ].sort()
 
-// 必需依赖：Cordis 会等到这些服务全部就绪才启动插件体。
+// 文件操作改走 node:fs 后，依赖只剩会话查询与工作区注册表（跨平台，不再需要 shell/fs 服务）。
 assert.deepEqual(
   [...inject].sort(),
-  ['fs', 'sandboxPolicy', 'sessionQuery', 'shell', 'workspaceRegistry'].sort(),
+  ['sessionQuery', 'workspaceRegistry'].sort(),
   'host 半边的必需依赖列表发生变化'
 )
 
-// 最小 Context 替身：Service 基类在构造时只要求 reflect.provide 可用；其余依赖
-// 服务缺失只会让可选字段保持 undefined，不影响 Remote 标记。
+// 最小 Context 替身：服务现在直接按 Cordis 契约注册，只需 reflect.provide 与 get。
 const provided = new Map()
 const ctx = {
   reflect: {
     provide: (key, value) => {
       provided.set(key, value)
+      return () => {
+        provided.delete(key)
+      }
     }
   },
   get: () => undefined
 }
-apply(ctx)
+await apply(ctx)
 
 const service = provided.get('sessionMigrate')
 assert.ok(service, 'sessionMigrate 服务未注册')
 assert.equal(service.name, 'sessionMigrate')
-assert.equal(service.typertRemote.namespace, 'sessionMigrate', 'wire 命名空间必须与客户端描述符一致')
+assert.equal(service.typertRemote.service, service, 'typertRemote.service 必须指向服务实例本身')
 assert.equal(service.typertRemote.serviceKey, 'sessionMigrate')
+assert.equal(service.typertRemote.namespace, 'sessionMigrate', 'wire 命名空间必须与客户端描述符一致')
 
-const markers = remoteMethods(service)
-assert.deepEqual(
-  markers.map((marker) => marker.method).sort(),
-  expectedMethods,
-  'Remote 标记缺失或多余'
-)
-for (const marker of markers) {
-  assert.equal(marker.invocation.kind, 'direct', `${marker.method} 应为 direct 调用`)
-  assert.equal(marker.exportName, undefined, `${marker.method} 不应重命名导出`)
-}
-
-// 宿主 gateway（typert-protocol 0.1.5）只认原型上的稳定字符串键描述符：
-// collectSrcClaims() 用它决定 /api/<namespace>/<method> 是否被认领，读不到就是 HTTP 404。
-// 而本仓库解析到的副本可能是 0.1.0-rc.6（标记存模块私有 WeakMap，宿主读不到），
-// 所以 host.js 必须同时写出这份描述符——这里把该契约固定下来。
+// 宿主 gateway 只认原型上的稳定字符串键描述符。
 const DESCRIPTOR_KEY = '@deepseek-ai/dsh-typert-protocol/remote-methods'
 const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(service), DESCRIPTOR_KEY)
 assert.ok(descriptor, '原型上缺少宿主 gateway 读取的稳定字符串键描述符')
@@ -66,7 +61,39 @@ assert.deepEqual(
   '字符串键描述符中的方法集合不完整'
 )
 for (const marker of descriptor.value.methods) {
-  assert.equal(marker.invocation.kind, 'direct', `${marker.method} 在字符串键描述符中应为 direct`)
+  assert.equal(marker.invocation.kind, 'direct', `${marker.method} 应为 direct 调用`)
+  assert.equal(marker.exportName, undefined, `${marker.method} 不应重命名导出`)
 }
 
-console.log('host 装配冒烟测试通过：8 个 direct 远程方法已同时写入两代标记契约。')
+// ── 文件层契约 ────────────────────────────────────────────────────────────────
+const workDir = join(here, '.tmp-fs')
+rmSync(workDir, { recursive: true, force: true })
+
+await service.writeTextEnsured(join(workDir, 'a', 'snapshot.json'), JSON.stringify({ ok: true }))
+assert.equal(JSON.parse(await service.fsReadText(join(workDir, 'a', 'snapshot.json'))).ok, true)
+assert.equal(await service.fsExists(join(workDir, 'a', 'snapshot.json')), true)
+assert.equal(await service.fsExists(join(workDir, 'missing.json')), false)
+
+const probe = join(workDir, 'probe.jsonl')
+writeFileSync(probe, 'hello')
+const info = await service.fileVersion(probe)
+assert.match(info.version, /^\d+:\d+:\d+:\d+:\d+$/, 'fingerprint 必须与 dsh-fs-local 的 versionOf 同形')
+assert.equal(info.size, 5)
+
+// Get-FileHash 的替代实现：sha256 大写十六进制，与已有 index.json 的哈希可直接比较。
+assert.match(await service.hashFile(probe), /^[0-9A-F]{64}$/)
+
+// 拷贝必须自动建父目录（原 PowerShell 版靠 New-Item -Force 做到这一点）。
+await service.copyFileEnsured(probe, join(workDir, 'nested', 'deep', 'copy.jsonl'))
+assert.equal(await service.fsExists(join(workDir, 'nested', 'deep', 'copy.jsonl')), true)
+
+// clearDir 与原实现同语义：保留点文件，清掉其余条目。
+writeFileSync(join(workDir, '.keep'), 'x')
+await service.clearDir(workDir)
+assert.equal(await service.fsExists(join(workDir, '.keep')), true, 'clearDir 不应删除点文件')
+assert.equal(await service.fsExists(probe), false, 'clearDir 应删除普通条目')
+
+await service.removePath(workDir)
+assert.equal(await service.fsExists(workDir), false)
+
+console.log('host 装配冒烟测试通过：服务注册、字符串键标记、文件层契约均符合宿主要求。')
