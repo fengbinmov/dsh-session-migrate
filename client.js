@@ -44,30 +44,64 @@ window.__ModuleLoader__.load({
 
     const passSchema = { parse: (v) => v }
 
+    // typert 的 strict codec 必须携带非空 typeSymbol：注册表的 validateCodec 会读
+    // 它的 length，缺失时就是那句 "Cannot read properties of undefined (reading
+    // 'length')"。schema 用 parse 直通即可（严格校验由服务端承担），并同时带上
+    // create() 以满足两代 harness 契约——旧版读 schema.parse()，新版读
+    // create().parse()，两侧都只做 typeof 检查，因此一个对象即可覆盖。
+    function codecOf(typeSymbol) {
+      return {
+        mode: 'strict',
+        typeSymbol: typeSymbol,
+        schema: passSchema,
+        create: function () { return passSchema }
+      }
+    }
+
     function param(name) {
-      return { name: name, wire: name, source: 'json', codec: { mode: 'strict', schema: passSchema } }
+      return { name: name, wire: name, source: 'json', codec: codecOf('session-migrate#param/' + name) }
+    }
+
+    // 描述符的 id / service / namespace / method 都是注册表校验的必填段，缺任何一项
+    // 都会在 validateNonempty / validateSegment 里读 undefined.length 抛错。
+    function descriptor(method, parameters) {
+      return {
+        id: 'session-migrate#sessionMigrate/' + method,
+        service: 'sessionMigrate',
+        namespace: 'sessionMigrate',
+        method: method,
+        invocation: { kind: 'direct' },
+        parameters: parameters,
+        result: codecOf('session-migrate#sessionMigrate/' + method)
+      }
     }
 
     function contribution() {
       return {
         package: 'session-migrate',
         descriptors: [
-          { namespace: 'sessionMigrate', method: 'listGroups', invocation: { kind: 'direct' }, parameters: [], result: { mode: 'strict', schema: passSchema } },
-          { namespace: 'sessionMigrate', method: 'listSessions', invocation: { kind: 'direct' }, parameters: [param('cwd')], result: { mode: 'strict', schema: passSchema } },
-          { namespace: 'sessionMigrate', method: 'loadSelection', invocation: { kind: 'direct' }, parameters: [], result: { mode: 'strict', schema: passSchema } },
-          { namespace: 'sessionMigrate', method: 'saveSelection', invocation: { kind: 'direct' }, parameters: [param('sessionIds')], result: { mode: 'strict', schema: passSchema } },
-          { namespace: 'sessionMigrate', method: 'unarchive', invocation: { kind: 'direct' }, parameters: [param('id')], result: { mode: 'strict', schema: passSchema } },
-          { namespace: 'sessionMigrate', method: 'deleteWorkspace', invocation: { kind: 'direct' }, parameters: [param('path')], result: { mode: 'strict', schema: passSchema } },
-          { namespace: 'sessionMigrate', method: 'export', invocation: { kind: 'direct' }, parameters: [param('sessionIds')], result: { mode: 'strict', schema: passSchema } },
-          { namespace: 'sessionMigrate', method: 'import', invocation: { kind: 'direct' }, parameters: [param('path')], result: { mode: 'strict', schema: passSchema } }
+          descriptor('listGroups', []),
+          descriptor('listSessions', [param('cwd')]),
+          descriptor('loadSelection', []),
+          descriptor('saveSelection', [param('sessionIds')]),
+          descriptor('unarchive', [param('id')]),
+          descriptor('deleteWorkspace', [param('path')]),
+          descriptor('export', [param('sessionIds')]),
+          descriptor('import', [param('path')])
         ]
       }
     }
 
     function apply(ctx) {
-      const remote = ctx.remote.sessionMigrate
+      // 远程命名空间服务由 $mount 异步安装，客户端不做惰性代理查找：挂载完成前
+      // ctx.remote.sessionMigrate 恒为 undefined。因此这里先保存挂载句柄，每次
+      // 调用时再解析命名空间，而不是在 apply 同步阶段取快照。
+      const mount = ctx.remote.$mount(contribution())
 
       async function rpc(method, ...args) {
+        await mount
+        const remote = ctx.get('remote.sessionMigrate')
+        if (remote === undefined) throw new Error('会话迁移服务尚未就绪，请稍后重试')
         const result = await remote[method](...args)
         if (!result.ok) {
           const err = result.error
@@ -435,7 +469,18 @@ window.__ModuleLoader__.load({
         ])
       }
 
-      ctx.effect(() => ctx.remote.$mount(contribution()))
+      ctx.effect(() => {
+        let cancelled = false
+        let dispose
+        mount.then(function (d) {
+          if (cancelled) d()
+          else dispose = d
+        }, function () {})
+        return function () {
+          cancelled = true
+          if (dispose !== undefined) dispose()
+        }
+      }, 'session-migrate: remote contribution')
       ctx.slots.inject('settings.section', function () {
         return ctx.slots.register(
           { name: 'settings.section', id: 'session-migrate', order: 50, label: '会话迁移' },

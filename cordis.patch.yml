@@ -1,0 +1,8 @@
+# session-migrate bundle patch: inserts the plugin row into a dsh profile's
+# layer stack (declared by the `dsh.bundle.patch` manifest field).
+# The row is a bare plugin by package name: the node half (exports ".") runs in
+# the host process, and the dsh.client declaration in package.json makes the
+# browser half (exports "./client") load in the web GUI.
+- insert:
+    - id: session-migrate
+      name: 'session-migrate'

@@ -6,6 +6,26 @@ export const inject = ['sessionQuery', 'fs', 'shell', 'workspaceRegistry', 'sand
 
 const REMOTE_METHODS = ['listGroups', 'listSessions', 'loadSelection', 'saveSelection', 'unarchive', 'deleteWorkspace', 'export', 'import']
 
+// 宿主 gateway 发现“源码模式”远程端点的唯一依据，是服务原型上这个稳定字符串键
+// 描述符——新版协议改用原型属性，正是为了让另一个已安装副本也能读到。
+// 但本包 import 解析到的 typert-protocol 副本是 0.1.0-rc.6，它把标记存进模块私有
+// 的 WeakMap，宿主（0.1.5-rc.3）读不到，端点就会以 HTTP 404 收场。因此这里按新
+// 约定手工补一份描述符，同时保留下面的 Remote() 调用以兼容旧宿主。
+const REMOTE_METHODS_KEY = '@deepseek-ai/dsh-typert-protocol/remote-methods'
+
+function markRemoteMethod(prototype, method) {
+  const existing = Object.getOwnPropertyDescriptor(prototype, REMOTE_METHODS_KEY)
+  const methods = existing && existing.value && Array.isArray(existing.value.methods) ? existing.value.methods : []
+  if (methods.some((entry) => entry.method === method)) return
+  Object.defineProperty(prototype, REMOTE_METHODS_KEY, {
+    configurable: true,
+    value: Object.freeze({
+      version: 1,
+      methods: Object.freeze(methods.concat([Object.freeze({ method: method, invocation: Object.freeze({ kind: 'direct' }) })]))
+    })
+  })
+}
+
 class SessionMigrateService extends TypertRemoteService {
   constructor(ctx) {
     super(ctx, 'sessionMigrate', { namespace: 'sessionMigrate' })
@@ -25,6 +45,7 @@ class SessionMigrateService extends TypertRemoteService {
         static: false,
         addInitializer: (initializer) => initializer.call(instance)
       })
+      markRemoteMethod(SessionMigrateService.prototype, method)
     }
   }
 
