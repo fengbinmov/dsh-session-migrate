@@ -31,6 +31,7 @@ window.__ModuleLoader__.load({
         '.sm-err { color:#dc2626; font-size:12px; white-space:pre-wrap; }',
         '.sm-ok { color:#16a34a; font-size:12px; white-space:pre-wrap; word-break:break-all; }',
         '.sm-debug { font-size:11px; opacity:.55; white-space:pre-wrap; }',
+        '.sm-unlinked { border:1px solid rgba(128,128,128,.25); border-radius:8px; padding:8px; margin-top:8px; display:flex; flex-direction:column; gap:6px; }',
         '.sm-status { display:inline-block; min-width:44px; text-align:center; font-size:11px; padding:1px 6px; border-radius:4px; white-space:nowrap; box-sizing:border-box; }',
         '.sm-status.none { opacity:.45; }',
         '.sm-status.unchanged { color:#16a34a; }',
@@ -87,7 +88,11 @@ window.__ModuleLoader__.load({
           descriptor('unarchive', [param('id')]),
           descriptor('deleteWorkspace', [param('path')]),
           descriptor('export', [param('sessionIds')]),
-          descriptor('import', [param('path')])
+          descriptor('import', [param('path')]),
+          descriptor('listUnlinkedGroups', []),
+          descriptor('checkRelocation', [param('sourceCwd'), param('targetCwd')]),
+          descriptor('applyRelocation', [param('sourceCwd'), param('targetCwd')]),
+          descriptor('reconcileMembership', [])
         ]
       }
     }
@@ -127,6 +132,13 @@ window.__ModuleLoader__.load({
         const [importPath, setImportPath] = React.useState('')
         const [importResult, setImportResult] = React.useState(null)
         const [error, setError] = React.useState(null)
+        // ── 未关联工作区 / 重定位 ──────────────────────────────────────────────
+        const [unlinked, setUnlinked] = React.useState(null)
+        const [unlinkedOpen, setUnlinkedOpen] = React.useState({})
+        const [mappingDrafts, setMappingDrafts] = React.useState({})
+        const [checks, setChecks] = React.useState({})
+        const [relocationBusy, setRelocationBusy] = React.useState(null)
+        const [relocationSummary, setRelocationSummary] = React.useState(null)
 
         function errText(e) {
           if (e && e.message) return e.message
@@ -159,11 +171,86 @@ window.__ModuleLoader__.load({
             const data = await rpc('listGroups')
             setGroups((data && data.groups) || [])
             setDebug((data && data.debug) || null)
-            setSessionsByKey({})
+            // 刻意不清空 sessionsByKey：刷新分组信息（计数、状态）不该把用户展开着的
+            // 会话列表一并清掉——那看起来就像"点了按钮之后列表自己折叠了"。
+            // 会话明细由 ensureSessions 按需拉取，折叠时丢弃、下次展开重新拉。
           } catch (e) {
             setError(errText(e))
           } finally {
             setLoadingGroups(false)
+          }
+        }
+
+        // 未关联工作区：cwd 在本机不存在（或未注册）的会话。它们不属于任何工作区，
+        // 在 DSH 侧栏里是隐身的——必须单独列出来，配映射做重定位。
+        async function loadUnlinked() {
+          try {
+            const data = await rpc('listUnlinkedGroups')
+            const list = (data && data.groups) || []
+            setUnlinked(list)
+            // 已存过映射的预填进输入框；用户已经改过的草稿不覆盖。
+            setMappingDrafts(function (prev) {
+              const next = {}
+              for (const group of list) {
+                next[group.cwd] = prev[group.cwd] !== undefined ? prev[group.cwd] : (group.mappedTo || '')
+              }
+              return next
+            })
+          } catch (e) {
+            setUnlinked([])
+          }
+        }
+
+        async function doCheckRelocation(cwd) {
+          const target = String(mappingDrafts[cwd] || '').trim()
+          setError(null)
+          setRelocationBusy(cwd)
+          try {
+            const result = await rpc('checkRelocation', cwd, target)
+            setChecks(function (prev) {
+              const next = {}
+              for (const key in prev) next[key] = prev[key]
+              next[cwd] = result
+              return next
+            })
+          } catch (e) {
+            setError(errText(e))
+          } finally {
+            setRelocationBusy(null)
+          }
+        }
+
+        async function doApplyRelocation(cwd) {
+          const target = String(mappingDrafts[cwd] || '').trim()
+          setError(null)
+          setRelocationBusy(cwd)
+          setRelocationSummary(null)
+          try {
+            const result = await rpc('applyRelocation', cwd, target)
+            if (result && result.ok === false) {
+              // 检测不通过：把问题摊在输入框下面，而不是丢一个笼统错误。
+              setChecks(function (prev) {
+                const next = {}
+                for (const key in prev) next[key] = prev[key]
+                next[cwd] = result
+                return next
+              })
+              return
+            }
+            // 成功后这一组会从未关联里消失，所以结果要放在区域顶部才看得到。
+            setRelocationSummary(result)
+            setChecks(function (prev) {
+              const next = {}
+              for (const key in prev) next[key] = prev[key]
+              delete next[cwd]
+              return next
+            })
+            await loadUnlinked()
+            await loadGroups()
+          } catch (e) {
+            setError(errText(e))
+          } finally {
+            setRelocationBusy(null)
           }
         }
 
@@ -179,6 +266,7 @@ window.__ModuleLoader__.load({
         React.useEffect(function () {
           loadGroups()
           loadSelection()
+          loadUnlinked()
         }, [])
 
         function toggleGroup(key) {
@@ -195,6 +283,15 @@ window.__ModuleLoader__.load({
             const n = {}
             for (const k in prev) n[k] = prev[k]
             n[key] = !n[key]
+            return n
+          })
+        }
+
+        function toggleUnlinked(cwd) {
+          setUnlinkedOpen(function (prev) {
+            const n = {}
+            for (const k in prev) n[k] = prev[k]
+            n[cwd] = !n[cwd]
             return n
           })
         }
@@ -223,7 +320,16 @@ window.__ModuleLoader__.load({
         function onToggleGroup(group) {
           const willOpen = !expanded[group.key]
           toggleGroup(group.key)
-          if (willOpen) ensureSessions(group)
+          if (willOpen) {
+            ensureSessions(group)
+            return
+          }
+          // 折叠时丢掉该组的明细缓存：下次展开会重新拉，数据总是新鲜的。
+          setSessionsByKey(function (prev) {
+            const next = {}
+            for (const key in prev) if (key !== group.key) next[key] = prev[key]
+            return next
+          })
         }
 
         function toggle(id) {
@@ -259,6 +365,9 @@ window.__ModuleLoader__.load({
             const r = await rpc('unarchive', id)
             if (r && r.error) { setError(r.error); return }
             const cwd = groupKey === '__orphan__' ? null : groupKey
+            // 顺序要紧：先刷新分组（它会保留明细缓存），再回填这一组的明细。
+            // 反过来做的话，loadGroups 会把刚拉回来的明细一起清掉，列表当场"自己折叠"。
+            await loadGroups()
             const data = await rpc('listSessions', cwd)
             setSessionsByKey(function (prev) {
               const n = {}
@@ -266,7 +375,6 @@ window.__ModuleLoader__.load({
               n[groupKey] = (data && data.sessions) || []
               return n
             })
-            await loadGroups()
           } catch (e) {
             setError(errText(e))
           }
@@ -315,6 +423,8 @@ window.__ModuleLoader__.load({
             // 导入会把恢复出来的会话并入勾选列表，这里必须同步刷新，否则界面
             // 仍然显示成未勾选，看起来像"恢复了却没被选上"。
             await loadSelection()
+            // 导入也可能带出新的未关联工作区（cwd 在本机不存在的那批）。
+            await loadUnlinked()
           } catch (e) {
             setError(errText(e))
           }
@@ -397,7 +507,7 @@ window.__ModuleLoader__.load({
             const isOpen = !!expanded[key]
             const items = sessionsByKey[key]
             const isLoading = loadingKey === key
-            const title = group.title || group.path || '未关联工作区'
+            const title = group.title || group.path || '无工作区会话'
             const archivedCount = group.archivedCount || 0
             const activeCount = group.sessionCount - archivedCount
             const countLabel = archivedCount > 0 ? (activeCount + ' | ' + archivedCount) : String(activeCount)
@@ -429,6 +539,67 @@ window.__ModuleLoader__.load({
           })
         }
 
+        // 未关联工作区：一组一张卡片，带目标路径输入框和"检测 / 应用"两个动作。
+        function renderUnlinked() {
+          if (unlinked === null) return h('div', { className: 'sm-hint' }, '加载中…')
+          if (unlinked.length === 0) return h('div', { className: 'sm-hint' }, '没有未关联的工作区')
+          return unlinked.map(function (group) {
+            const cwd = group.cwd
+            const isOpen = !!unlinkedOpen[cwd]
+            const draft = mappingDrafts[cwd] !== undefined ? mappingDrafts[cwd] : (group.mappedTo || '')
+            const check = checks[cwd]
+            const busy = relocationBusy === cwd
+            const blocked = busy || String(draft).trim() === ''
+            const sessions = group.sessions || []
+            return h('div', { key: cwd, className: 'sm-unlinked' }, [
+              h('div', { className: 'sm-ws-row', onClick: function () { toggleUnlinked(cwd) } }, [
+                h('span', { className: 'sm-ws-caret' }, isOpen ? '▾' : '▸'),
+                h('span', { className: 'sm-ws', title: cwd }, cwd),
+                h('span', { className: 'sm-hint' }, String(group.sessionCount) + ' 个会话'),
+                h('span', { className: 'sm-status none' }, group.targetExists ? '目标已存在' : '待重定位')
+              ]),
+              isOpen ? h('div', { className: 'sm-sessions-indent' }, sessions.map(function (s) {
+                return h('div', { key: s.id, className: 'sm-item' }, [
+                  h('span', { className: 'sm-item-title', title: s.id }, s.id),
+                  h('div', { className: 'sm-item-meta' }, [
+                    h('span', { className: 'sm-delta' }, formatSize(s.size))
+                  ])
+                ])
+              })) : null,
+              h('div', { className: 'sm-row' }, [
+                h('input', {
+                  className: 'sm-input',
+                  placeholder: '目标路径，例如 D:\\Projects\\my-project',
+                  value: draft,
+                  onChange: function (e) {
+                    const value = e.target.value
+                    setMappingDrafts(function (prev) {
+                      const n = {}
+                      for (const k in prev) n[k] = prev[k]
+                      n[cwd] = value
+                      return n
+                    })
+                  }
+                }),
+                h('button', {
+                  className: 'sm-btn sm-btn-mini',
+                  disabled: blocked,
+                  onClick: function () { doCheckRelocation(cwd) }
+                }, busy ? '处理中…' : '检测重定位是否有效'),
+                h('button', {
+                  className: 'sm-btn sm-btn-mini primary',
+                  disabled: blocked || (check !== undefined && check.ok === false),
+                  onClick: function () { doApplyRelocation(cwd) }
+                }, '应用重定位')
+              ]),
+              check === undefined ? null : (check.ok
+                ? h('div', { className: 'sm-ok' }, '检测通过：可重定位 ' + (check.info ? check.info.sessionCount : 0) + ' 个会话'
+                    + (check.info && check.info.willCreate ? '（将创建目标目录）' : ''))
+                : h('div', { className: 'sm-err' }, check.problems.map(function (problem) { return '· ' + problem.message }).join('\n')))
+            ])
+          })
+        }
+
         const exportBtnStyle = exporting ? {
           background: 'rgba(128,128,128,.25)',
           borderColor: 'transparent',
@@ -456,6 +627,15 @@ window.__ModuleLoader__.load({
             exportResult ? h('div', { className: 'sm-ok' }, '已导出 ' + exportResult.sessionCount + ' 个会话 → ' + exportResult.path) : null
           ]),
           h('div', { className: 'sm-card' }, [
+            h('div', { className: 'sm-title' }, '未关联工作区'),
+            h('p', { className: 'sm-hint', style: { margin: 0 } }, '这些会话的原始工作区目录在本机不存在，所以它们不属于任何工作区、在侧栏里看不到。填一个目标路径就能把它们迁过来；映射会被记住，下次导入自动套用。'),
+            relocationSummary ? h('div', { className: 'sm-ok' }, '重定位完成：迁移 ' + relocationSummary.moved + ' 个会话 → ' + relocationSummary.targetCwd + (relocationSummary.pendingRestart ? '\n重启 DSH 之后这些工作区才会出现在侧栏。' : '')) : null,
+            relocationSummary && relocationSummary.failed && relocationSummary.failed.length
+              ? h('div', { className: 'sm-err' }, relocationSummary.failed.map(function (item) { return '· ' + item.id + '：' + item.error }).join('\n'))
+              : null,
+            renderUnlinked()
+          ]),
+          h('div', { className: 'sm-card' }, [
             h('div', { className: 'sm-title' }, '从备份目录导入'),
             h('p', { className: 'sm-hint', style: { margin: 0 } }, '备份会覆盖相同会话的现有数据（即回滚到导出时的状态）。'),
             h('div', { className: 'sm-row' }, [
@@ -463,7 +643,15 @@ window.__ModuleLoader__.load({
               h('button', { className: 'sm-btn primary', onClick: doImport }, '导入')
             ]),
             importResult ? h('div', { className: 'sm-ok' }, '导入完成：新增 ' + importResult.imported + ' 个，覆盖 ' + importResult.overwritten + ' 个') : null,
-            importResult && importResult.detached > 0 ? h('div', { className: 'sm-hint' }, '其中 ' + importResult.detached + ' 个已写回磁盘，但未挂到工作区（原工作区目录在当前机器上不可用）；若该目录可用，重启 DSH 后会自动归位。') : null
+            importResult && importResult.detached > 0 ? h('div', { className: 'sm-hint' }, '其中 ' + importResult.detached + ' 个已写回磁盘，但未挂到工作区（原工作区目录在当前机器上不可用）；若该目录可用，重启 DSH 后会自动归位。') : null,
+            // 跳过的条目一定要说出来：跨机器同步备份时最常见的失手就是只同步了
+            // index.json 而漏掉 sessions/，那时整体都会跳过，不说就变成"导入成功但没数据"。
+            importResult && importResult.skipped > 0
+              ? h('div', { className: 'sm-err' }, '有 ' + importResult.skipped + ' 个会话被跳过（未写入）：\n'
+                  + (importResult.skippedItems || []).map(function (item) {
+                    return '· ' + (item.id || '(条目无 id)') + '：' + item.reason
+                  }).join('\n'))
+              : null
           ]),
           error ? h('div', { className: 'sm-err' }, error) : null
         ])

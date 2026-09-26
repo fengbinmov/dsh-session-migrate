@@ -62,6 +62,10 @@ const namespace = {
   loadSelection: async () => {
     remoteCalls.push('loadSelection')
     return { ok: true, value: { selected: [] } }
+  },
+  listUnlinkedGroups: async () => {
+    remoteCalls.push('listUnlinkedGroups')
+    return { ok: true, value: { groups: [] } }
   }
 }
 
@@ -151,7 +155,7 @@ assert.throws(() => validateDescriptor({
 // 挂载贡献：8 个 direct 方法，命名空间 sessionMigrate，且必须通过注册表校验
 assert.ok(contribution, '$mount 未被调用')
 assert.equal(contribution.package, 'session-migrate')
-assert.equal(contribution.descriptors.length, 8, '远程描述符数量应为 8')
+assert.equal(contribution.descriptors.length, 12, '远程描述符数量应为 12')
 for (const descriptor of contribution.descriptors) {
   assert.equal(descriptor.namespace, 'sessionMigrate')
   assert.equal(descriptor.service, 'sessionMigrate')
@@ -163,7 +167,9 @@ for (const descriptor of contribution.descriptors) {
 const hostSource = readFileSync(join(here, '..', 'host.js'), 'utf8')
 const expectedWires = {
   listGroups: [], listSessions: ['cwd'], loadSelection: [], saveSelection: ['sessionIds'],
-  unarchive: ['id'], deleteWorkspace: ['path'], export: ['sessionIds'], import: ['path']
+  unarchive: ['id'], deleteWorkspace: ['path'], export: ['sessionIds'], import: ['path'],
+  listUnlinkedGroups: [], checkRelocation: ['sourceCwd', 'targetCwd'], applyRelocation: ['sourceCwd', 'targetCwd'],
+  reconcileMembership: []
 }
 for (const descriptor of contribution.descriptors) {
   const match = new RegExp('\\n  async ' + descriptor.method + '\\(([^)]*)\\)').exec(hostSource)
@@ -193,7 +199,7 @@ resolveMount(async () => {})
 await new Promise((resolve) => setTimeout(resolve, 0))
 await new Promise((resolve) => setTimeout(resolve, 0))
 
-assert.deepEqual(remoteCalls.sort(), ['listGroups', 'loadSelection'], '挂载完成后应发出两个初始调用')
+assert.deepEqual(remoteCalls.sort(), ['listGroups', 'listUnlinkedGroups', 'loadSelection'], '挂载完成后应发出三个初始调用')
 const groupsWrite = setterCalls.find((call) => call.index === 0)
 assert.ok(groupsWrite, 'groups 状态未被写入')
 assert.deepEqual(groupsWrite.value, [{ key: 'ws-1' }], 'groups 状态应收到工作区分组')
@@ -203,3 +209,4 @@ assert.equal(typeof effects[0].disposer, 'function', 'effect 未返回清理函�
 effects[0].disposer()
 
 console.log('client 装配冒烟测试通过：远程命名空间在挂载完成后才被解析。')
+
