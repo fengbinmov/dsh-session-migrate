@@ -9,15 +9,26 @@ window.__ModuleLoader__.load({
         '.sm-wrap { display:flex; flex-direction:column; gap:14px; }',
         '.sm-card { border:1px solid rgba(128,128,128,.35); border-radius:10px; padding:14px; display:flex; flex-direction:column; gap:10px; }',
         '.sm-title { font-size:14px; font-weight:600; margin:0; }',
-        '.sm-section-title { font-size:13px; font-weight:600; margin:4px 0 0; }',
+        // 标题行：标题 + 紧挨着的图标按钮（刷新）。gap 小一点，让图标靠近标题。
+        '.sm-title-row { display:flex; align-items:center; gap:6px; }',
+        // 刷新图标完全不摆按钮的样子：默认很淡、和标题融为一体，只在悬停时浮出来。
+        // 它刻意**不带** .sm-btn，免得继承那套边框/圆角/内边距。
+        '.sm-btn-icon { padding:0 4px; font-size:15px; line-height:1; border:none; background:transparent; color:inherit; opacity:.45; cursor:pointer; transition:opacity .15s, background .15s; }',
+        '.sm-btn-icon:hover:not(:disabled) { opacity:1; background:rgba(128,128,128,.16); border-radius:4px; }',
+        '.sm-btn-icon:disabled { cursor:default; opacity:.3; }',
         '.sm-hint { font-size:12px; opacity:.65; }',
         '.sm-row { display:flex; align-items:center; gap:8px; }',
-        '.sm-ws { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; font-weight:600; }',
+        // 未导出的工作区用常规字重；已导出（含"有变化"）的加粗，备份过的那批一眼可辨。
+        '.sm-ws { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; font-weight:400; }',
+        '.sm-ws-exported { font-weight:600; }',
         '.sm-ws-row { display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none; }',
         '.sm-divider { border:none; border-top:1px solid rgba(128,128,128,.22); margin:5px 0; }',
         '.sm-ws-caret { width:12px; font-size:11px; opacity:.6; flex-shrink:0; }',
         '.sm-sessions-indent { padding-left:20px; }',
         '.sm-item { display:flex; align-items:center; gap:8px; padding:4px 0; font-size:13px; }',
+        // 已归档的会话整行淡化，与「已归档 N 个」那行同一个视觉语气，
+        // 展开后一眼就能和未归档的区分开。
+        '.sm-item-archived { opacity:.7; }',
         '.sm-item-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }',
         '.sm-item-meta { display:flex; align-items:center; gap:6px; flex-shrink:0; }',
         '.sm-archived-toggle { display:flex; align-items:center; gap:8px; padding:4px 0; font-size:13px; cursor:pointer; opacity:.7; user-select:none; }',
@@ -25,7 +36,11 @@ window.__ModuleLoader__.load({
         '.sm-btn:disabled { opacity:.6; cursor:default; }',
         '.sm-btn.primary { background:#3b82f6; border-color:#3b82f6; color:#fff; }',
         '.sm-btn-mini { padding:2px 8px; font-size:12px; }',
-        '.sm-btn-danger { color:#dc2626; border-color:rgba(220,38,38,.5); }',
+        // 删除入口默认是灰的，移上去才变红——会话多的时候，一排红按钮太扎眼。
+        // 宽度收窄，且两态文字同为 2 个字（删除 / 确认），切换时列宽不会变，
+        // 否则状态列会被顶得左右跳。
+        '.sm-btn-danger { color:#9ca3af; border-color:rgba(128,128,128,.4); min-width:44px; box-sizing:border-box; transition:color .15s, border-color .15s; }',
+        '.sm-btn-danger:hover { color:#dc2626; border-color:rgba(220,38,38,.5); }',
         '.sm-export-btn { position:relative; overflow:hidden; transition:background .15s; }',
         '.sm-input { flex:1; padding:6px 10px; border-radius:6px; border:1px solid rgba(128,128,128,.4); background:transparent; color:inherit; font-size:13px; }',
         '.sm-err { color:#dc2626; font-size:12px; white-space:pre-wrap; }',
@@ -39,6 +54,9 @@ window.__ModuleLoader__.load({
         '.sm-status.new { color:#2563eb; }',
         '.sm-status.archived { color:#6b7280; border:1px solid rgba(128,128,128,.4); }',
         '.sm-delta { font-size:11px; opacity:.7; white-space:nowrap; min-width:52px; text-align:right; }',
+        // 工作区行右侧的会话个数。和 .sm-delta 同宽，这样工作区与会话的「状态」才会
+        // 落在同一竖直列上（两行尾部都是「固定宽 → 状态 → 固定宽删除按钮」）。
+        '.sm-count { font-size:11px; opacity:.6; min-width:52px; text-align:right; white-space:nowrap; }',
         '.sm-baidu-code { font-size:20px; font-weight:700; letter-spacing:3px; font-family:ui-monospace,SFMono-Regular,Consolas,monospace; user-select:all; }',
         '.sm-baidu-box { border:1px solid rgba(128,128,128,.25); border-radius:8px; padding:10px; display:flex; flex-direction:column; gap:8px; align-items:flex-start; }',
         '.sm-link { color:#3b82f6; font-size:12px; word-break:break-all; }',
@@ -288,6 +306,17 @@ window.__ModuleLoader__.load({
           loadBaidu()
         }, [])
 
+        // 删除按钮上膛（变成「确认」）之后，点页面任何其他地方都自动取消并退回「删除」，
+        // 免得确认态一直挂着。按钮自己的 onClick 里有 stopPropagation，所以点它不会被
+        // 这里取消——第一次点仍然能顺利进入确认态。
+        React.useEffect(function () {
+          if (confirmDelete === null) return undefined
+          if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return undefined
+          const cancel = function () { setConfirmDelete(null) }
+          document.addEventListener('click', cancel)
+          return function () { document.removeEventListener('click', cancel) }
+        }, [confirmDelete])
+
         // 只有「等授权」和「任务进行中」两种状态才需要持续刷新，其余时候完全不轮询——
         // 面板可能长期开着，无谓的轮询既费电又会把宿主的日志刷满。
         const baiduPhase = baidu ? baidu.phase : null
@@ -366,10 +395,6 @@ window.__ModuleLoader__.load({
           for (const k in selected) n[k] = selected[k]
           n[id] = !n[id]
           setSelectedPersist(n)
-        }
-
-        function clearSelection() {
-          setSelectedPersist({})
         }
 
         function countSelected() {
@@ -720,17 +745,26 @@ window.__ModuleLoader__.load({
         }
 
         function sessionItem(s, groupKey) {
-          // 删除只给**未勾选**的会话：勾选代表"要保留/导出"，那一批不该摆着删除入口。
           const confirmKey = 'session:' + s.id
           const armed = confirmDelete === confirmKey
-          return h('div', { key: s.id, className: 'sm-item' }, [
+          // 已归档的整行淡化，和「已归档 N 个」那行同色——展开后仍能一眼分辨。
+          const rowClass = s.archived ? 'sm-item sm-item-archived' : 'sm-item'
+          const canDelete = !selected[s.id] && !s.archived
+          return h('div', { key: s.id, className: rowClass }, [
             h('input', { type: 'checkbox', checked: !!selected[s.id], onChange: function () { toggle(s.id) } }),
             h('span', { className: 'sm-item-title', title: s.title, onClick: function () { toggle(s.id) } }, s.title),
             h('div', { className: 'sm-item-meta' }, [
-              sessionStatusView(s),
+              // 顺序与工作区行保持一致（固定宽 → 状态 → 删除按钮），
+              // 这样两行的「状态」才会落在同一竖直列上。
               sizeDeltaView(s),
-              selected[s.id] ? null : h('button', {
+              sessionStatusView(s),
+              // 删除入口只给**未勾选、未归档**的会话：勾选代表"要保留/导出"；
+              // 已归档的那批在折叠区里，给它们摆删除入口既没必要也容易误点。
+              // 但不能删的行也必须**占住同样的宽度**（用 visibility 隐藏）——直接不渲染的话
+              // 这一行尾部会少一列，状态就右移、和别的行错开了。
+              h('button', {
                 className: 'sm-btn sm-btn-mini sm-btn-danger',
+                style: canDelete ? undefined : { visibility: 'hidden' },
                 onClick: function (e) {
                   e.stopPropagation()
                   if (armed) {
@@ -740,7 +774,7 @@ window.__ModuleLoader__.load({
                     setConfirmDelete(confirmKey)
                   }
                 }
-              }, armed ? '确认删除?' : '删除'),
+              }, armed ? '确认' : '删除'),
               s.archived ? h('button', {
                 className: 'sm-btn sm-btn-mini',
                 onClick: function () { doUnarchive(s.id, groupKey) }
@@ -792,11 +826,14 @@ window.__ModuleLoader__.load({
               index > 0 ? h('hr', { className: 'sm-divider' }) : null,
               h('div', { className: 'sm-ws-row', onClick: function () { onToggleGroup(group) } }, [
                 h('span', { className: 'sm-ws-caret' }, isOpen ? '▾' : '▸'),
-                h('span', { className: 'sm-ws' }, title),
-                h('span', { className: 'sm-hint' }, countLabel),
+                h('span', { className: group.hasExport ? 'sm-ws sm-ws-exported' : 'sm-ws' }, title),
+                h('span', { className: 'sm-count' }, countLabel),
                 groupStatusView(group),
-                group.path ? h('button', {
+                // 「无工作区会话」那一组没有可删的工作区，但同样要占住按钮宽度，
+                // 否则它的状态列会比别的工作区靠右。
+                h('button', {
                   className: 'sm-btn sm-btn-mini sm-btn-danger',
+                  style: group.path ? undefined : { visibility: 'hidden' },
                   onClick: function (e) {
                     e.stopPropagation()
                     if (confirmDelete === key) {
@@ -806,7 +843,7 @@ window.__ModuleLoader__.load({
                       setConfirmDelete(key)
                     }
                   }
-                }, confirmDelete === key ? '确认删除?' : '删除') : null
+                }, confirmDelete === key ? '确认' : '删除')
               ]),
               isOpen ? (
                 isLoading ? h('div', { className: 'sm-hint' }, '加载中…') :
@@ -888,19 +925,24 @@ window.__ModuleLoader__.load({
           h('p', { className: 'sm-hint', style: { margin: 0 } }, '将工作区中的会话内容与状态导出为备份目录，或从备份目录恢复。'),
           debug ? h('div', { className: 'sm-debug' }, debug) : null,
           h('div', { className: 'sm-card' }, [
-            h('div', { className: 'sm-row' }, [
-              h('button', { className: 'sm-btn', onClick: loadGroups, disabled: loadingGroups }, loadingGroups ? '加载中…' : '刷新列表'),
-              h('button', { className: 'sm-btn', onClick: clearSelection, disabled: countSelected() === 0 }, '清空已选'),
-              h('span', { className: 'sm-hint' }, '已选 ' + countSelected() + ' 个会话')
+            // 标题与刷新图标同一行：刷新紧挨着标题，不再单独占一行。
+            h('div', { className: 'sm-title-row' }, [
+              h('div', { className: 'sm-title' }, '工作控制区'),
+              h('button', {
+                className: 'sm-btn-icon',
+                title: '刷新列表',
+                'aria-label': '刷新列表',
+                onClick: loadGroups,
+                disabled: loadingGroups
+              }, loadingGroups ? '…' : '↻')
             ]),
-            h('div', { className: 'sm-section-title' }, '工作区状态'),
             renderGroups(),
             h('button', {
               className: 'sm-btn primary sm-export-btn',
               onClick: doExport,
               disabled: exporting || countSelected() === 0,
               style: exportBtnStyle
-            }, exporting ? '导出中…' : ('导出 ' + countSelectedWorkspaces() + ' 个工作区')),
+            }, exporting ? '导出中…' : ('导出 ' + countSelectedWorkspaces() + ' 个工作区（' + countSelected() + ' 个对话）')),
             exportResult ? h('div', { className: 'sm-ok' }, '已导出 ' + exportResult.sessionCount + ' 个会话 → ' + exportResult.path) : null
           ]),
           h('div', { className: 'sm-card' }, [
@@ -965,3 +1007,4 @@ window.__ModuleLoader__.load({
     return { apply, inject: ['slots', 'remote'] }
   }
 })
+
