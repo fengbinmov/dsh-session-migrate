@@ -1,7 +1,12 @@
 import { createHash } from 'node:crypto'
+import { createWriteStream } from 'node:fs'
 import { copyFile, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { constants as zlibConstants, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
+
+import { BaiduPanClient, DEFAULT_REMOTE_SUBDIR, joinRemote, normalizeCredentials, normalizeRemotePath, relativeTo } from './baidu.js'
 
 export const name = 'session-migrate'
 
@@ -64,10 +69,14 @@ function firstZstdFrame(buffer) {
 // 描述符——新版协议改用原型属性，正是为了让另一个已安装副本也能读到。
 const REMOTE_METHODS_KEY = '@deepseek-ai/dsh-typert-protocol/remote-methods'
 
-const REMOTE_METHODS = ['listGroups', 'listSessions', 'loadSelection', 'saveSelection', 'unarchive', 'deleteWorkspace', 'export', 'import', 'listUnlinkedGroups', 'checkRelocation', 'applyRelocation', 'reconcileMembership']
+const REMOTE_METHODS = ['listGroups', 'listSessions', 'loadSelection', 'saveSelection', 'unarchive', 'deleteWorkspace', 'deleteSession', 'export', 'import', 'listUnlinkedGroups', 'checkRelocation', 'applyRelocation', 'reconcileMembership', 'baiduStatus', 'baiduLoginStart', 'baiduLoginCancel', 'baiduLogout', 'baiduUpload', 'baiduDownload']
 
 // selection.json 里表示"无工作区会话"那一组的键（cwd 为空的会话）。
 const ORPHAN_KEY = '__orphan__'
+
+// 百度网盘应用凭证的文件名（放在 $DSH_HOME/session-migrate/ 下）。
+// 这个文件由用户自己维护，插件只读不写——凭证是私密信息，不该由代码生成或覆盖。
+const BAIDU_CREDENTIALS_FILE = 'panbaidu.json'
 
 // 归组时读不出 cwd 的会话先落到这一组（等下次读得出来再归位），
 // 绝不因为读不出 header 就把用户的勾选丢掉。
@@ -122,6 +131,21 @@ class SessionMigrateService {
     this.dshHomePath = ctx.get('dshHomePath')
     this.sessionPersistence = ctx.get('sessionPersistence')
     this.sessionLogCache = new Map()
+    // ── 百度网盘 ────────────────────────────────────────────────────────────
+    // 客户端惰性创建：没配 dshHomePath 或没登录时，整条链路都不该启动。
+    this.baidu = undefined
+    // 允许测试注入 fetch；undefined 时 BaiduPanClient 自己退回全局 fetch。
+    let injectedFetch
+    try { injectedFetch = ctx.get('baiduFetch') } catch (e) {}
+    this.baiduFetch = typeof injectedFetch === 'function' ? injectedFetch : undefined
+    this.baiduPending = null
+    this.baiduTimer = null
+    this.baiduLastError = null
+    this.baiduRefreshFailedAt = 0
+    this.baiduTask = null
+    this.baiduLocalCache = null
+    // 建客户端时用的凭证指纹：用户改了 panbaidu.json 就靠它发现并重建。
+    this.baiduCredentialsKey = null
     this.typertRemote = Object.freeze({
       service: this,
       serviceKey: 'sessionMigrate',
@@ -269,6 +293,18 @@ class SessionMigrateService {
       }
     }
     return found
+  }
+
+  // 丢掉"查询索引里还有、磁盘上已经没了"的会话。
+  //
+  // 宿主的会话查询是 SQLite 派生索引，而它只在**搜索**时才与持久化对账
+  // （dsh-session-query-sqlite 的 _reconcile 会算出 persistentDeletes 并删行）。
+  // listSessions / filterSessions 是直接读库的，所以删掉日志文件之后，那些会话
+  // 会一直留在查询结果里——面板上就表现为"删了还在"。这里按磁盘实际存在的会话过滤。
+  async dropMissingSessions(records) {
+    if (records.length === 0) return records
+    const logs = await this.scanSessionLogs()
+    return records.filter((r) => logs.has(this.encodeSegment(String(r.header.id))))
   }
 
   async isDirectory(path) {
@@ -504,8 +540,11 @@ class SessionMigrateService {
     await rm(path, { recursive: true, force: true })
   }
 
-  // 与原 PowerShell 实现同语义：只清空非隐藏条目，保留点文件。
-  async clearDir(path) {
+  // 与原 PowerShell 实现同语义：默认只清空非隐藏条目，保留点文件。
+  // 但「获取」时要求本地与云端完全一致，那时连点文件也要清（传 keepDotFiles: false），
+  // 否则云端没有的文件会以隐藏文件的形式在本地留一辈子。
+  async clearDir(path, options) {
+    const keepDotFiles = !(options !== undefined && options !== null && options.keepDotFiles === false)
     let entries
     try {
       entries = await readdir(path, { withFileTypes: true })
@@ -513,7 +552,7 @@ class SessionMigrateService {
       return
     }
     for (const entry of entries) {
-      if (entry.name.startsWith('.')) continue
+      if (keepDotFiles && entry.name.startsWith('.')) continue
       await rm(join(path, entry.name), { recursive: true, force: true })
     }
   }
@@ -620,7 +659,10 @@ class SessionMigrateService {
       }
     }
     try {
-      const orphans = await this.sessionQuery.filterSessions([{ kind: 'cwd', values: [null] }])
+      // 过滤掉磁盘上已经没了的：查询索引是 SQLite 派生库，删文件后它不会自动对账。
+      const orphans = await this.dropMissingSessions(
+        await this.sessionQuery.filterSessions([{ kind: 'cwd', values: [null] }])
+      )
       if (orphans.length > 0) {
         const expected = exported.get(this.normKey(ORPHAN_KEY))
         let hasExport = false
@@ -669,6 +711,8 @@ class SessionMigrateService {
     } catch (e) {
       return { sessions: [], error: this.errText(e) }
     }
+    // 查询索引不会因为文件被删就自动对账（它只在搜索时对账），这里按磁盘实际存在的过滤。
+    records = await this.dropMissingSessions(records)
     const titleMap = {}
     try {
       const titles = await this.sessionQuery.readTitleSnapshots(records.map((r) => r.header.id))
@@ -970,17 +1014,83 @@ class SessionMigrateService {
     return { ok: true, deletedSessions: sessionIds.length }
   }
 
+  // 删除一个会话的全部数据。工作区删除是同样的几个动作，只是范围从"整个工作区"
+  // 缩小到"一个会话"：日志、投影缓存、工作区归属、勾选记录都清掉。
+  async deleteSession(id) {
+    if (!id) return { error: '缺少会话 id' }
+    if (typeof this.dshHomePath !== 'function') return { error: '无法确定 DSH_HOME 路径' }
+    const wanted = String(id)
+    this.sessionLogCache.clear()
+    await this.flushAll()
+    // 从磁盘上定位：查询服务看不到的会话（cwd 在本机不存在的那批）同样要能删掉。
+    const entry = (await this.scanSessionHeaders()).find((item) => String(item.id) === wanted)
+    if (entry === undefined) return { error: '未找到该会话的数据' }
+    const sessionDir = dirname(entry.filePath)
+    const projectDir = dirname(sessionDir)
+    try { await this.removePath(sessionDir) } catch (e) {}
+    try {
+      await this.removePath(this.dshHomePath('storages', 'session_projcache', 'sessions', wanted + '.json'))
+    } catch (e) {}
+    // 摘掉工作区归属。**不能**拿 sessionIds getter 过滤后的集合来判断"要不要摘"：
+    // 那个集合只包含"路径还认得出来"的会话，索引一旦不同步（宿主重建过索引、或文件
+    // 已经先被删掉），它里面就没有这个 id，判断会失真，record.sessionIds 上的归属
+    // 会永远留着——随后这个会话就以"cwd 认不出来"的形态漂到「无工作区会话」里去。
+    // detachSession 对不在名下的 id 是安全的 no-op，所以直接逐个工作区试。
+    if (this.workspaceRegistry !== undefined) {
+      for (const w of this.workspaceRegistry.list()) {
+        try { await w.detachSession(wanted) } catch (e) {}
+      }
+      // 索引里也要把它清掉：文件已经没了，留着只会让侧栏把它当成"路径认不出来的会话"。
+      await this.syncSessionIndex(wanted, null)
+    }
+    // 勾选记录里也去掉——会话已经不存在了，留着只会被下次读取当成无效项清掉。
+    const state = await this.readSelectionState()
+    let changed = false
+    for (const group of state.groups) {
+      const kept = group.sessionIds.filter((sid) => String(sid) !== wanted)
+      if (kept.length === group.sessionIds.length) continue
+      group.sessionIds = kept
+      changed = true
+    }
+    if (changed) {
+      state.groups = state.groups.filter((group) => group.sessionIds.length > 0)
+      await this.writeSelectionState(state)
+    }
+    // 项目目录空了就顺手收掉，免得留下空壳。
+    try {
+      const left = await readdir(projectDir)
+      if (left.length === 0) await this.removePath(projectDir)
+    } catch (e) {}
+    return { ok: true, id: wanted, cwd: entry.cwd }
+  }
+
   async export(sessionIds) {
     const ids = sessionIds || []
     if (typeof this.dshHomePath !== 'function') return { error: '无法确定 DSH_HOME 路径' }
     await this.flushAll()
     this.sessionLogCache.clear()
     const exportBase = this.dshHomePath('session-migrate', 'exports')
+    // 先把上一次记下的上传状态捞出来——导出会清空整个 exports 目录，
+    // 等清完再想读就晚了。丢了它，每次导出都会让增量上传彻底失效
+    // （表现为：明明什么都没变，却要全量重传）。
+    const previousUploads = new Map()
+    try {
+      for (const entry of await this.readExportIndex()) {
+        if (entry === null || typeof entry !== 'object') continue
+        if (typeof entry.id !== 'string') continue
+        previousUploads.set(String(entry.id), {
+          hash: typeof entry.hash === 'string' ? entry.hash : null,
+          remoteHash: typeof entry.remoteHash === 'string' ? entry.remoteHash : null
+        })
+      }
+    } catch (e) {}
     try { await this.clearDir(exportBase) } catch (e) {}
     const archived = new Set(this.archivedIds().map(String))
     const headerById = {}
     try {
-      const records = await this.sessionQuery.listSessions()
+      // 同样过滤掉查询索引里残留、磁盘上已经没有的会话，否则它们会带着"文件找不到"
+      // 混进导出流程（虽然最终会被跳过，但没必要让它们参与）。
+      const records = await this.dropMissingSessions(await this.sessionQuery.listSessions())
       for (const r of records) headerById[r.header.id] = r
     } catch (e) {}
     const items = []
@@ -1020,6 +1130,12 @@ class SessionMigrateService {
         const info = await this.fileVersion(item.src)
         fingerprint = info.version
       } catch (e) {}
+      // remoteHash 记的是「网盘上那份内容的 hash」，上传成功后才会被写成当时的 hash。
+      // 它必须跨导出保留，但要跟着内容走：
+      //   - 内容没变（新旧 hash 相同）→ 继承原值，增量上传才认得出「这份已经传过了」
+      //   - 内容变了 → 归零，因为网盘上那份已经不是这个版本了
+      const previous = previousUploads.get(String(item.id))
+      const remoteHash = previous !== undefined && previous.hash === hash ? previous.remoteHash : null
       // 只写"不可派生"的东西。目录名一律不存：projectKey 是有损编码（D:\a-b\c 和
       // D:\a\b-c 会编成同一个 --D-a-b-c--，超长还会被截断），既反解不回 cwd，也不该
       // 被当成权威——DSH 自己就是按当前规则校验"日志与路径是否相符"的。
@@ -1028,15 +1144,17 @@ class SessionMigrateService {
         cwd: item.cwd,
         fileName: item.fileName,
         hash: hash,
+        remoteHash: remoteHash,
         fingerprint: fingerprint,
         archived: archived.has(String(item.id))
       })
     }
     const index = {
       format: 'dsh-sessions-export',
-      // v3：去掉了可派生的 sessionSegment / relativePath，以及从没被读过、header 里
-      // 本来就有 的 createdAt / parentSession / agentPreset / origin。读取兼容 v2。
-      version: 3,
+      // v4：新增 remoteHash（云端那份内容的 hash，用于增量上传）。
+      // v3 去掉了可派生的 sessionSegment / relativePath，以及从没被读过、header 里
+      // 本来就有 的 createdAt / parentSession / agentPreset / origin。读取兼容 v2/v3。
+      version: 4,
       exportedAt: Date.now(),
       sessions: entries
     }
@@ -1068,6 +1186,8 @@ class SessionMigrateService {
     const detached = []
     const deduped = new Set()
     const writtenById = new Map()
+    // 导入后每个会话的新文件版本，用于回写索引的 fingerprint（见写入处与收尾处）。
+    const reAligned = new Map()
     // 跳过的条目要报出来：跨机器同步备份时很容易只同步了 index.json 而漏掉 sessions/，
     // 那样以前会表现为"导入成功但一个都没进来"，用户完全不知道发生了什么。
     const skipped = []
@@ -1163,6 +1283,12 @@ class SessionMigrateService {
         if (targetCwd !== null && targetCwd !== undefined && this.normKey(targetCwd) !== this.normKey(s.cwd || '')) {
           try { await this.rewriteSessionHeaderCwd(dst, targetCwd) } catch (e) {}
         }
+        // 刚刚落盘的这个文件是**新拷贝**：inode、mtime、ctime 全是新的，
+        // 与备份里记的 fingerprint 必然对不上。把新版本记下来，导入结束后回写索引——
+        // 否则用户刚从备份恢复完，看到的却是满屏「有变化」，而那明明不是他的改动。
+        try {
+          reAligned.set(String(s.id), (await this.fileVersion(dst)).version)
+        } catch (e) {}
         if (exists) {
           overwritten.push(s.id)
           try { await this.removePath(this.dshHomePath('storages', 'session_projcache', 'sessions', s.id + '.json')) } catch (e) {}
@@ -1174,8 +1300,9 @@ class SessionMigrateService {
         // 所以先补建目录再注册；两步都失败才记入 detached（如实报告，不假装成功）。
         if (targetCwd && this.workspaceRegistry !== undefined) {
           try {
-            // 先清掉该会话可能残留的旧 header 缓存，让归属能当场恢复而不是等重启。
-            this.forgetCachedHeaders([s.id])
+            // 先把索引里这个会话的归属路径对齐到它刚落下的位置，归属才挂得住。
+            // 纯内存操作，逐条做也不贵。
+            await this.syncSessionIndex(s.id, targetCwd)
             const ws = await this.workspaceRegistry.create(targetCwd)
             await ws.attachSession(s.id)
           } catch (e) {
@@ -1193,6 +1320,15 @@ class SessionMigrateService {
             await this.workspaceRegistry.archiveSession(s.id)
           } catch (e) {}
         }
+      } catch (e) {}
+    }
+    // 把刚落盘的新文件版本回写索引：导入之后，磁盘上的状态就是「当前状态」，
+    // 索引里的 fingerprint 必须跟着走，否则工作区列表会一直显示「有变化」。
+    // 内容哈希（hash / remoteHash）不动——恢复的是同一份内容，它们本来就该相等。
+    let realigned = 0
+    if (reAligned.size > 0) {
+      try {
+        realigned = await this.realignIndexFingerprints(base, reAligned)
       } catch (e) {}
     }
     // 恢复出来的会话马上就并入勾选（见下），所以这里不需要再重建任何快照——
@@ -1213,6 +1349,7 @@ class SessionMigrateService {
       detached: detached.length,
       deduped: deduped.size,
       skipped: skipped.length,
+      realigned: realigned,
       // 明细最多给 20 条：整批都对不上时（典型：只同步了 index.json 没同步 sessions/）
       // 不必把上千条错误塞回界面，有总数和几个样本足够判断原因。
       skippedItems: skipped.slice(0, 20),
@@ -1220,6 +1357,31 @@ class SessionMigrateService {
       overwrittenIds: overwritten,
       detachedIds: detached
     }
+  }
+
+  /**
+   * 把导入后重新落盘的文件版本回写到备份索引里。
+   *
+   * 为什么必须做：导入是把文件**重新拷贝**一遍，inode / mtime / ctime 全是新的，
+   * 而索引里记的 fingerprint 是导出那一刻源文件的版本，两者必然对不上。不对齐的话，
+   * 用户刚从备份恢复完，工作区列表却全是「有变化」——那是拷贝的副作用，不是他的改动。
+   *
+   * 只改 fingerprint。hash / remoteHash 不动：恢复的是同一份内容，它们本来就相等。
+   */
+  async realignIndexFingerprints(indexPath, fingerprints) {
+    const index = JSON.parse(await this.fsReadText(indexPath))
+    if (index === null || typeof index !== 'object' || !Array.isArray(index.sessions)) return 0
+    let updated = 0
+    for (const entry of index.sessions) {
+      if (entry === null || typeof entry !== 'object') continue
+      const next = fingerprints.get(String(entry.id))
+      if (next === undefined) continue
+      if (entry.fingerprint === next) continue
+      entry.fingerprint = next
+      updated += 1
+    }
+    if (updated > 0) await this.fsWriteText(indexPath, JSON.stringify(index, null, 2))
+    return updated
   }
 
   // 检测一次重定位是否真的可行。逐项给出问题，而不是笼统地说"不行"——
@@ -1354,11 +1516,11 @@ class SessionMigrateService {
     if (this.workspaceRegistry !== undefined && moved.length > 0) {
       try {
         const ws = await this.workspaceRegistry.create(canonical)
-        // 先让 DSH 忘掉这些会话的旧 header 缓存，否则 attachSession 会拿搬家前的
-        // cwd 去校验、必然失败（这就是"必须重启"的根因）。
-        this.forgetCachedHeaders(moved)
         for (const id of moved) {
           try {
+            // 把索引里的旧路径改成新位置：只清缓存不写回的话，attachSession 记下的
+            // 归属会被 sessionIds getter 过滤掉，界面上这个工作区的会话数会变 0。
+            await this.syncSessionIndex(id, canonical)
             await ws.attachSession(id)
             attached += 1
           } catch (e) {
@@ -1401,6 +1563,10 @@ class SessionMigrateService {
       if (entry.cwd === null || entry.id === null) continue
       const workspace = registered.get(this.normKey(entry.cwd))
       if (workspace === undefined) continue
+      // 先把索引里的归属路径对齐到磁盘上的实际位置：下面的 members 判断走的是
+      // sessionIds getter，它只认"路径已知"的会话；索引陈旧时判断会失真，
+      // attachSession 也不会真正生效。纯内存操作，逐条做不贵。
+      await this.syncSessionIndex(entry.id, entry.cwd)
       const members = Array.from(workspace.sessionIds || []).map(String)
       if (members.includes(String(entry.id))) continue
       try {
@@ -1414,27 +1580,996 @@ class SessionMigrateService {
     return { repaired: repaired, failed: failed, scanned: scanned.length, workspaces: registered.size }
   }
 
-  // 让 DSH 忘掉这些会话的 header 索引缓存。
-  // workspaceRegistry 把每个会话的 header 缓存在内存里；文件搬家后缓存里的 cwd 还是旧的，
-  // attachSession 会拿旧 cwd 去校验、必然失败——这就是"重定位后必须重启"的真正根因。
-  // 清掉之后 attachSession 会重新扫描磁盘读到新 header，于是当场就能归位。
-  // 这些字段没有公开 API，所以全程 best-effort：拿不到就退化成"需要重启"。
-  forgetCachedHeaders(ids) {
+  // 把某个会话在宿主工作区索引里的归属路径，对齐到它当前的真实位置。
+  //
+  // 必须**直接写索引表**，不能"清掉等宿主重建"：对**活跃会话**（正在对话的那个），
+  // readSessionHeader 会先命中 live 会话然后直接 return，根本不会走重建分支
+  // （见 dsh-workspace 的 readSessionHeader）。于是 sessionPaths 里永远没有它，
+  // sessionIds getter 会把它过滤掉——表现就是它在侧栏里以"路径不认识"的形态
+  // 掉进「未分组」。非活跃会话反而会走到重建分支，所以只有当前对话会中招。
+  //
+  // targetPath 传 null 表示"它不该再属于任何工作区"（删除会话时用）。
+  // 这几个字段没有公开 API，全程 best-effort：拿不到就退化成"需要重启"。
+  async syncSessionIndex(id, targetPath) {
+    if (this.workspaceRegistry === undefined) return
     const registry = this.workspaceRegistry
-    if (registry === undefined) return 0
-    let cleared = 0
-    for (const id of ids) {
-      const key = String(id)
-      for (const field of ['headers', 'sessionPaths', 'invalidSessionPaths']) {
+    const key = String(id)
+    const drop = (field) => {
+      try {
+        const cache = registry[field]
+        if (cache !== undefined && typeof cache.delete === 'function') cache.delete(key)
+      } catch (e) {}
+    }
+    // header 缓存一并清掉：我们可能刚改过文件里的 cwd，缓存里那份已经过时了。
+    drop('headers')
+    if (targetPath === null || targetPath === undefined) {
+      drop('sessionPaths')
+      drop('invalidSessionPaths')
+      return
+    }
+    // 宿主存的是 realpathNormalize 的结果（解析软链、统一大小写），这里对齐它。
+    let canonical = targetPath
+    try { canonical = await realpath(targetPath) } catch (e) {}
+    try {
+      const paths = registry.sessionPaths
+      if (paths !== undefined && typeof paths.set === 'function') paths.set(key, canonical)
+    } catch (e) {}
+    drop('invalidSessionPaths')
+  }
+
+  // ── 百度网盘同步 ────────────────────────────────────────────────────────────
+  // 本地 exports/ 目录与网盘 /apps/<应用名>/AI/exports 之间逐文件双向同步。
+  // 之所以是逐文件而不是打包：百度网盘的分片上传本身就带秒传（MD5 命中就不传），
+  // 保持目录结构意味着网盘上能直接看到 index.json 与 sessions/，重传也几乎瞬间完成。
+
+  baiduConfigPath() {
+    if (typeof this.dshHomePath !== 'function') return undefined
+    return this.dshHomePath('session-migrate', 'baidu.json')
+  }
+
+  panbaiduConfigPath() {
+    if (typeof this.dshHomePath !== 'function') return undefined
+    return this.dshHomePath('session-migrate', BAIDU_CREDENTIALS_FILE)
+  }
+
+  /**
+   * 读应用凭证。
+   *
+   * 只从文件读，代码里不留任何默认值：凭证等同于账号身份，写进源码就等于写进版本库，
+   * 一次 push 之后再也收不回来。
+   *
+   * 每种失败都给出可区分的原因——「文件不在」要引导用户去创建，「内容不是 JSON」
+   * 要让他去看格式，「缺字段」要指出缺哪个。笼统报一句「凭证有问题」帮不上忙。
+   */
+  async readBaiduCredentials() {
+    const path = this.panbaiduConfigPath()
+    if (path === undefined) return { ok: false, reason: 'unavailable', path: null }
+    let raw
+    try {
+      raw = JSON.parse(await this.fsReadText(path))
+    } catch (e) {
+      const missing = e !== null && e !== undefined && (e.code === 'ENOENT' || /ENOENT/.test(String(e.message)))
+      return { ok: false, reason: missing ? 'missing' : 'unreadable', path: path, error: this.errText(e) }
+    }
+    try {
+      return {
+        ok: true,
+        path: path,
+        credentials: normalizeCredentials(raw),
+        // 落点与凭证放在同一个文件里：两者都属于「这个应用该怎么用」的配置，
+        // 而且都是私密的、由用户自己维护的东西。
+        remotePath: normalizeRemotePath(raw)
+      }
+    } catch (e) {
+      return { ok: false, reason: 'invalid', path: path, error: this.errText(e) }
+    }
+  }
+
+  /**
+   * 拿一个可以用的客户端。
+   * 凭证换了就重建——否则用户改完文件，插件还在拿旧身份请求授权。
+   */
+  async baiduClientReady() {
+    const state = await this.readBaiduCredentials()
+    if (!state.ok) return state
+    const key = state.credentials.appKey + '\u0000' + state.credentials.secretKey
+    if (this.baidu === undefined || this.baiduCredentialsKey !== key) {
+      this.baidu = new BaiduPanClient({ fetchImpl: this.baiduFetch, credentials: state.credentials })
+      this.baiduCredentialsKey = key
+    }
+    return { ok: true, client: this.baidu, path: state.path, remotePath: state.remotePath }
+  }
+
+  exportsLocalPath() {
+    if (typeof this.dshHomePath !== 'function') return undefined
+    return this.dshHomePath('session-migrate', 'exports')
+  }
+
+  async readBaiduConfig() {
+    const path = this.baiduConfigPath()
+    if (path === undefined) return {}
+    try {
+      const data = JSON.parse(await this.fsReadText(path))
+      return data !== null && typeof data === 'object' && !Array.isArray(data) ? data : {}
+    } catch (e) {
+      return {}
+    }
+  }
+
+  async writeBaiduConfig(config) {
+    const path = this.baiduConfigPath()
+    if (path === undefined) return false
+    try {
+      await this.fsWriteText(path, JSON.stringify(config, null, 2))
+      return true
+    } catch (e) {
+      return false
+    }
+  }
+
+  baiduReasonText(state) {
+    if (state.reason === 'not-logged-in') return '还没有登录百度网盘'
+    if (state.reason === 'expired') return '百度网盘的登录态已失效，请重新登录'
+    if (state.reason === 'unavailable') return '无法确定 DSH_HOME，百度网盘功能不可用'
+    if (state.reason === 'missing') return '还没有配置百度网盘应用凭证：请创建 ' + (state.path || BAIDU_CREDENTIALS_FILE)
+    if (state.reason === 'unreadable') return '应用凭证文件读不出来：' + (state.error || '不是合法的 JSON')
+    if (state.reason === 'invalid') return '应用凭证不完整：' + (state.error || '')
+    return state.error || '百度网盘不可用'
+  }
+
+  /**
+   * 取一个可用的 access_token。
+   * 快过期（不足 10 分钟）时用 refresh_token 换新的；刷新失败不当作致命错误——
+   * 旧 token 可能还在有效期内，真的失效会在业务调用上以 errno=-6 如实报出来。
+   */
+  async ensureBaiduToken() {
+    if (this.baiduConfigPath() === undefined) return { ok: false, reason: 'unavailable' }
+    const ready = await this.baiduClientReady()
+    if (!ready.ok) return { ok: false, reason: ready.reason, path: ready.path, error: ready.error }
+    const client = ready.client
+    const config = await this.readBaiduConfig()
+    const accessToken = typeof config.accessToken === 'string' ? config.accessToken : ''
+    if (accessToken === '') {
+      client.accessToken = null
+      return { ok: false, reason: 'not-logged-in' }
+    }
+    client.accessToken = accessToken
+    const expiresAt = Number(config.expiresAt) || 0
+    if (expiresAt - Date.now() > 10 * 60 * 1000) return { ok: true, config }
+    const refreshToken = typeof config.refreshToken === 'string' ? config.refreshToken : ''
+    if (refreshToken === '') return { ok: true, config }
+    // 刷新失败后 60 秒内不再重试：面板会轮询状态，不节流的话会把授权接口打爆
+    // （百度对刷新频率有风控，触发后是整个应用一起被限流）。
+    if (Date.now() - this.baiduRefreshFailedAt < 60 * 1000) return { ok: true, config }
+    try {
+      const token = await client.refreshAccessToken(refreshToken)
+      const next = {
+        ...config,
+        accessToken: token.accessToken,
+        refreshToken: token.refreshToken || refreshToken,
+        expiresAt: token.expiresAt,
+        scope: token.scope || config.scope
+      }
+      await this.writeBaiduConfig(next)
+      client.accessToken = next.accessToken
+      return { ok: true, config: next }
+    } catch (e) {
+      this.baiduRefreshFailedAt = Date.now()
+      return { ok: true, config, warning: this.errText(e) }
+    }
+  }
+
+  /**
+   * 确定网盘落点。
+   *
+   * 落点来自 `panbaidu.json` 的 `RemotePath`，两种写法都支持：
+   *   - 绝对路径（`/apps/dsh/AI/exports`）：用户已经把话说明白了，不必再探测应用目录
+   *   - 相对路径（`AI/exports`）：拼在应用目录后面；应用名只有列一次 /apps 才知道，
+   *     探到就记进 baidu.json 复用，下次不必再探
+   * 没配则用默认的 AI/exports——不配也能用，配了就按用户的来。
+   */
+  async resolveBaiduPaths(config) {
+    const settings = config || (await this.readBaiduConfig())
+    const ready = await this.baiduClientReady()
+    if (!ready.ok) return { ok: false, error: this.baiduReasonText(ready) }
+    const client = ready.client
+    const configured = typeof ready.remotePath === 'string' ? ready.remotePath : ''
+
+    if (configured.startsWith('/')) {
+      // 绝对路径：开放平台只允许应用访问自己的 /apps/<应用名>/，路径不合规的话
+      // 与其等 API 报一个含糊的 42213，不如在这里就说清楚。
+      const segments = configured.split('/').filter((part) => part !== '')
+      if (segments.length < 3 || segments[0] !== 'apps') {
+        return {
+          ok: false,
+          error: 'panbaidu.json 里的 RemotePath 必须是 /apps/<应用名>/... 形式的绝对路径，当前是 ' + configured
+        }
+      }
+      const appRoot = '/' + segments[0] + '/' + segments[1]
+      return { ok: true, appRoot: appRoot, remotePath: configured, source: 'configured' }
+    }
+
+    let appRoot = typeof settings.appRoot === 'string' && settings.appRoot !== '' ? settings.appRoot : null
+    if (appRoot === null) {
+      try {
+        appRoot = await client.findAppRoot()
+      } catch (e) {
+        return { ok: false, error: this.errText(e) }
+      }
+      await this.writeBaiduConfig({ ...settings, appRoot })
+    }
+    const subdir = configured !== '' ? configured : DEFAULT_REMOTE_SUBDIR
+    return {
+      ok: true,
+      appRoot: appRoot,
+      remotePath: appRoot.replace(/\/+$/, '') + '/' + subdir,
+      source: configured !== '' ? 'configured' : 'default'
+    }
+  }
+
+  /**
+   * 递归扫描本地导出目录，返回待同步的文件清单。
+   *
+   * 清单里带上索引记录的 `hash` / `remoteHash`——上传靠它俩判断「这份内容是不是
+   * 已经在云端了」，从而跳过重传。关联方式是现算的落位（与导出/导入同一套规则），
+   * 所以不依赖索引里存目录名。
+   */
+  async scanLocalExportFiles() {
+    const base = this.exportsLocalPath()
+    if (base === undefined) return []
+    const metaByRelative = new Map()
+    for (const entry of await this.readExportIndex()) {
+      if (entry === null || typeof entry !== 'object') continue
+      if (typeof entry.id !== 'string' || typeof entry.fileName !== 'string') continue
+      const relative = [
+        'sessions',
+        this.projSeg(entry.cwd === undefined ? null : entry.cwd),
+        this.encodeSegment(entry.id),
+        entry.fileName
+      ].join('/')
+      metaByRelative.set(relative, {
+        id: entry.id,
+        hash: typeof entry.hash === 'string' ? entry.hash : null,
+        remoteHash: typeof entry.remoteHash === 'string' ? entry.remoteHash : null
+      })
+    }
+    const found = []
+    const walk = async (dir, prefix) => {
+      let entries = []
+      try {
+        entries = await readdir(dir, { withFileTypes: true })
+      } catch (e) {
+        return
+      }
+      for (const entry of entries) {
+        if (entry.name.startsWith('.')) continue
+        const relative = prefix === '' ? entry.name : prefix + '/' + entry.name
+        const absolute = join(dir, entry.name)
+        if (entry.isDirectory()) {
+          await walk(absolute, relative)
+          continue
+        }
+        if (!entry.isFile()) continue
         try {
-          const cache = registry[field]
-          if (cache !== undefined && typeof cache.delete === 'function') {
-            if (cache.delete(key)) cleared += 1
-          }
+          const info = await stat(absolute)
+          const meta = metaByRelative.get(relative)
+          found.push({
+            relative: relative,
+            absolute: absolute,
+            size: info.size,
+            mtimeMs: info.mtimeMs,
+            ctimeMs: info.ctimeMs,
+            id: meta === undefined ? null : meta.id,
+            hash: meta === undefined ? null : meta.hash,
+            remoteHash: meta === undefined ? null : meta.remoteHash,
+            // index.json 自己不在索引的 sessions 列表里，没有可比的哈希。
+            // 它很小（几 KB），每次都传，不值得为它再引入一份自指的记录。
+            tracked: meta !== undefined
+          })
         } catch (e) {}
       }
     }
-    return cleared
+    await walk(base, '')
+    // index.json 排在最后：它是「这份备份完整」的标志。先传会话、最后传索引，
+    // 中途失败时网盘上留下的仍然是一份能对得上号的旧备份，而不是半个新备份。
+    found.sort((a, b) => {
+      const aIndex = a.relative === 'index.json' ? 1 : 0
+      const bIndex = b.relative === 'index.json' ? 1 : 0
+      if (aIndex !== bIndex) return aIndex - bIndex
+      return a.relative.localeCompare(b.relative)
+    })
+    return found
+  }
+
+  /** 本地导出目录的概况。面板会轮询状态，所以这里带 3 秒缓存。 */
+  async localExportSummary() {
+    const base = this.exportsLocalPath()
+    if (base === undefined) {
+      return { exists: false, fileCount: 0, totalSize: 0, exportedAt: null, sessionCount: null }
+    }
+    const now = Date.now()
+    if (this.baiduLocalCache !== null && now - this.baiduLocalCache.at < 3000) return this.baiduLocalCache.value
+    const files = await this.scanLocalExportFiles()
+    let totalSize = 0
+    for (const file of files) totalSize += file.size
+    let exportedAt = null
+    let sessionCount = null
+    try {
+      const index = JSON.parse(await this.fsReadText(join(base, 'index.json')))
+      exportedAt = Number(index.exportedAt) || null
+      sessionCount = Array.isArray(index.sessions) ? index.sessions.length : null
+    } catch (e) {}
+    const value = {
+      exists: files.length > 0,
+      fileCount: files.length,
+      totalSize: totalSize,
+      exportedAt: exportedAt,
+      sessionCount: sessionCount
+    }
+    this.baiduLocalCache = { at: now, value }
+    return value
+  }
+
+  /** 面板要的全部状态。刻意不在这里做网络请求——它会被高频轮询。 */
+  async baiduSnapshot() {
+    const config = await this.readBaiduConfig()
+    const credentialState = await this.readBaiduCredentials()
+    const pending = this.baiduPending
+    // 凭证没配好时「已登录」无从谈起：那个 token 是用另一份身份换来的。
+    const loggedIn = credentialState.ok && typeof config.accessToken === 'string' && config.accessToken !== ''
+    const appRoot = typeof config.appRoot === 'string' && config.appRoot !== '' ? config.appRoot : null
+    // 落点与 resolveBaiduPaths 保持同一套规则，但这里只做纯计算：
+    // 绝对路径直接用；相对路径要拼应用目录，而应用目录可能还没探测过，
+    // 那就先如实显示成「待登录后确定」，不去为了显示而发请求。
+    const configured = credentialState.ok && typeof credentialState.remotePath === 'string'
+      ? credentialState.remotePath
+      : ''
+    const subdir = configured !== '' ? configured : DEFAULT_REMOTE_SUBDIR
+    const remotePath = credentialState.ok
+      ? (subdir.startsWith('/') ? subdir : (appRoot === null ? null : appRoot.replace(/\/+$/, '') + '/' + subdir))
+      : null
+    return {
+      available: this.baiduConfigPath() !== undefined,
+      configured: credentialState.ok,
+      credentialsPath: this.panbaiduConfigPath() || null,
+      credentialsProblem: credentialState.ok ? null : {
+        reason: credentialState.reason,
+        message: this.baiduReasonText(credentialState)
+      },
+      loggedIn: loggedIn,
+      phase: pending !== null ? 'waiting' : (loggedIn ? 'authorized' : 'idle'),
+      pending: pending === null ? null : {
+        userCode: pending.userCode,
+        verificationUrl: pending.verificationUrl,
+        qrcodeUrl: pending.qrcodeUrl,
+        expiresAt: pending.expiresAt,
+        interval: pending.interval
+      },
+      account: config.account || null,
+      appRoot: appRoot,
+      subdir: subdir,
+      // 落点是写死的默认值，还是用户在 panbaidu.json 里配的？面板要把这个说清楚，
+      // 否则用户改了配置却看到「没变化」，会以为配置没生效。
+      remotePathSource: configured !== '' ? 'configured' : 'default',
+      remotePath: remotePath,
+      localPath: this.exportsLocalPath() || null,
+      local: await this.localExportSummary(),
+      task: this.baiduTask,
+      lastUploadAt: Number(config.lastUploadAt) || null,
+      lastDownloadAt: Number(config.lastDownloadAt) || null,
+      error: this.baiduLastError
+    }
+  }
+
+  async baiduStatus() {
+    return await this.baiduSnapshot()
+  }
+
+  async baiduLoginStart() {
+    this.stopBaiduPolling()
+    this.baiduPending = null
+    this.baiduLastError = null
+    if (this.baiduConfigPath() === undefined) {
+      this.baiduLastError = '无法确定 DSH_HOME，百度网盘功能不可用'
+      return await this.baiduSnapshot()
+    }
+    const ready = await this.baiduClientReady()
+    if (!ready.ok) {
+      this.baiduLastError = this.baiduReasonText(ready)
+      return await this.baiduSnapshot()
+    }
+    const client = ready.client
+    try {
+      const code = await client.requestDeviceCode()
+      this.baiduPending = {
+        deviceCode: code.deviceCode,
+        userCode: code.userCode,
+        verificationUrl: code.verificationUrl,
+        qrcodeUrl: code.qrcodeUrl,
+        expiresAt: Date.now() + code.expiresIn * 1000,
+        interval: code.interval
+      }
+      this.startBaiduPolling(code.interval)
+    } catch (e) {
+      this.baiduLastError = this.errText(e)
+    }
+    return await this.baiduSnapshot()
+  }
+
+  async baiduLoginCancel() {
+    this.baiduPending = null
+    this.stopBaiduPolling()
+    return await this.baiduSnapshot()
+  }
+
+  async baiduLogout() {
+    this.baiduPending = null
+    this.stopBaiduPolling()
+    const config = await this.readBaiduConfig()
+    // 只丢凭证，留下 appRoot：下次登录的还是同一个应用，没必要再探一遍。
+    const next = { ...config }
+    delete next.accessToken
+    delete next.refreshToken
+    delete next.expiresAt
+    delete next.scope
+    delete next.account
+    await this.writeBaiduConfig(next)
+    if (this.baidu !== undefined) this.baidu.accessToken = null
+    this.baiduLastError = null
+    return await this.baiduSnapshot()
+  }
+
+  stopBaiduPolling() {
+    if (this.baiduTimer !== null) {
+      clearInterval(this.baiduTimer)
+      this.baiduTimer = null
+    }
+  }
+
+  /**
+   * 授权是异步完成的：用户得先拿着 user_code 去百度页面点同意。
+   * 所以这里在宿主内起一个轮询（而不是让浏览器轮询），关掉面板也不影响授权完成。
+   * 官方要求轮询间隔不低于 5 秒，低于这个值会被风控。
+   */
+  startBaiduPolling(intervalSeconds) {
+    this.stopBaiduPolling()
+    const seconds = Math.max(Number(intervalSeconds) || 5, 5)
+    // setInterval 不会等上一轮结束。网络慢的时候两次轮询会叠在一起，
+    // 那正好是百度风控最敏感的行为，所以自己挡一道。
+    let inFlight = false
+    const tick = async () => {
+      if (inFlight) return
+      const pending = this.baiduPending
+      if (pending === null) {
+        this.stopBaiduPolling()
+        return
+      }
+      if (Date.now() > pending.expiresAt) {
+        this.baiduPending = null
+        this.baiduLastError = '授权码已过期，请重新点「登录百度网盘」'
+        this.stopBaiduPolling()
+        return
+      }
+      inFlight = true
+      try {
+        // 每次轮询都重新确认凭证：用户可能在等待授权期间把 panbaidu.json 删了或改了。
+        const ready = await this.baiduClientReady()
+        if (!ready.ok) {
+          this.baiduPending = null
+          this.baiduLastError = this.baiduReasonText(ready)
+          this.stopBaiduPolling()
+          return
+        }
+        const client = ready.client
+        const result = await client.requestDeviceToken(pending.deviceCode)
+        if (result.pending) return
+        client.accessToken = result.token.accessToken
+        const config = await this.readBaiduConfig()
+        await this.writeBaiduConfig({ ...config, ...result.token })
+        this.baiduPending = null
+        this.baiduLastError = null
+        this.stopBaiduPolling()
+        // 登录成功后顺手把账号名和应用目录补上；失败也不影响登录本身。
+        await this.refreshBaiduIdentity().catch(() => {})
+      } catch (e) {
+        this.baiduPending = null
+        this.baiduLastError = this.errText(e)
+        this.stopBaiduPolling()
+      } finally {
+        inFlight = false
+      }
+    }
+    this.baiduTimer = setInterval(() => { tick() }, seconds * 1000)
+    if (typeof this.baiduTimer.unref === 'function') this.baiduTimer.unref()
+  }
+
+  async refreshBaiduIdentity() {
+    const config = await this.readBaiduConfig()
+    const next = { ...config }
+    const ready = await this.baiduClientReady()
+    if (!ready.ok) {
+      await this.writeBaiduConfig(next)
+      return next
+    }
+    const client = ready.client
+    try {
+      const info = await client.userInfo()
+      next.account = {
+        baiduName: info.baidu_name || '',
+        netdiskName: info.netdisk_name || '',
+        vipType: Number(info.vip_type) || 0
+      }
+    } catch (e) {}
+    if (typeof next.appRoot !== 'string' || next.appRoot === '') {
+      try {
+        next.appRoot = await client.findAppRoot()
+      } catch (e) {}
+    }
+    await this.writeBaiduConfig(next)
+    return next
+  }
+
+  beginBaiduTask(kind, total, message) {
+    this.baiduTask = {
+      running: true,
+      kind: kind,
+      total: total,
+      done: 0,
+      current: '',
+      message: message,
+      startedAt: Date.now(),
+      finishedAt: null,
+      result: null,
+      error: null
+    }
+  }
+
+  finishBaiduTask() {
+    const task = this.baiduTask
+    if (task === null) return
+    task.running = false
+    task.finishedAt = Date.now()
+    task.current = ''
+    task.message = task.error === null || task.error === undefined ? '完成' : '失败'
+  }
+
+  async baiduUpload() {
+    if (this.baiduTask !== null && this.baiduTask.running) {
+      this.baiduLastError = '已经有一个同步任务在进行中，请等它结束'
+      return await this.baiduSnapshot()
+    }
+    const tokenState = await this.ensureBaiduToken()
+    if (!tokenState.ok) {
+      this.baiduLastError = this.baiduReasonText(tokenState)
+      return await this.baiduSnapshot()
+    }
+    const paths = await this.resolveBaiduPaths(tokenState.config)
+    if (!paths.ok) {
+      this.baiduLastError = paths.error
+      return await this.baiduSnapshot()
+    }
+    const files = await this.scanLocalExportFiles()
+    if (files.length === 0) {
+      this.baiduLastError = '本地导出目录是空的，请先点上面的「导出」生成备份'
+      return await this.baiduSnapshot()
+    }
+    this.baiduLastError = null
+    this.beginBaiduTask('upload', files.length, '正在准备网盘目录…')
+    this.runBaiduUpload(paths, files).catch(() => {})
+    return await this.baiduSnapshot()
+  }
+
+  async runBaiduUpload(paths, files) {
+    const task = this.baiduTask
+    // 能走到这里说明 baiduUpload 已经确认过凭证并建好了客户端。
+    const client = this.baidu
+    // 每个文件的请求/响应摘要，最后落盘。参数位置、返回字段这类问题在界面上
+    // 一句话说不清，留一份原始记录比反复猜测有用得多。
+    const trace = []
+    try {
+      task.message = '正在准备网盘目录…'
+      await client.createDirTree(paths.remotePath, paths.appRoot)
+      // 建完必须确认一次。踩过的坑：create 返回 errno=0（"成功"），目录却根本没建出来，
+      // 随后 precreate 到一个不存在的目录，返回了一个看起来像秒传的响应。
+      try {
+        await client.listDir(paths.remotePath)
+      } catch (e) {
+        throw new Error('网盘目录 ' + paths.remotePath + ' 创建后仍然列不出来：' + this.errText(e))
+      }
+      // ① 先看清云端现在有什么。一次调用同时服务三件事：
+      //    判断哪些文件不用重传、找出云端多余的东西、以及上传后的核对基线。
+      task.message = '正在核对云端内容…'
+      const remoteEntries = await client.listAllEntries(paths.remotePath)
+      const remoteFiles = new Map()
+      const remoteDirs = []
+      for (const entry of remoteEntries) {
+        const relative = relativeTo(paths.remotePath, entry.path)
+        if (relative === null || relative === '') continue
+        if (Number(entry.isdir) === 1) remoteDirs.push(relative)
+        else remoteFiles.set(relative, entry)
+      }
+
+      // ② 决定哪些真的要传。跳过要同时满足三条，缺一条都可能造成假同步：
+      //      - 索引记得这份内容传过（remoteHash === hash）
+      //      - 云端确实还有这个文件（可能被人手动删了）
+      //      - 大小对得上（换过落点、或那个位置被别的内容占了）
+      const indexFile = files.find((file) => file.relative === 'index.json') || null
+      const skippedNames = []
+      const pending = []
+      for (const file of files) {
+        if (file.relative === 'index.json') continue
+        const onRemote = remoteFiles.get(file.relative)
+        const alreadyThere = file.tracked === true
+          && file.hash !== null
+          && file.remoteHash !== null
+          && file.remoteHash === file.hash
+          && onRemote !== undefined
+          && Number(onRemote.size) === file.size
+        if (alreadyThere) skippedNames.push(file.relative)
+        else pending.push(file)
+      }
+
+      const failed = []
+      let instant = 0
+      let done = 0
+      const uploadedRelative = new Set()
+      task.total = pending.length + (indexFile === null ? 0 : 1)
+      for (const file of pending) {
+        task.current = file.relative
+        task.message = '正在上传…'
+        try {
+          const result = await client.uploadFile({
+            filePath: file.absolute,
+            path: joinRemote(paths.remotePath, file.relative),
+            size: file.size,
+            ctime: Math.floor(file.ctimeMs / 1000),
+            mtime: Math.floor(file.mtimeMs / 1000)
+          })
+          if (result.instant) instant += 1
+          uploadedRelative.add(file.relative)
+          trace.push({
+            path: file.relative,
+            size: file.size,
+            instant: result.instant === true,
+            uploadedSlices: result.uploadedSlices,
+            precreate: result.precreateResponse || null
+          })
+        } catch (e) {
+          // 单个文件失败不中断整批：网盘上留下的是「大部分已同步」，
+          // 重跑一次即可补齐，比整批回滚更有用。
+          failed.push({ path: file.relative, error: this.errText(e) })
+          trace.push({
+            path: file.relative,
+            size: file.size,
+            error: this.errText(e),
+            payload: e && e.payload ? e.payload : null
+          })
+        }
+        done += 1
+        task.done = done
+      }
+
+      // ③ 把成功上传的结果写回本地索引，再传索引本身。
+      //    顺序很讲究：先更新 remoteHash、再传 index.json，云端那份索引才会带着正确的
+      //    上传状态；反过来做的话，下次「从百度云中获取」拉回来的索引会显得「都没传过」。
+      if (indexFile !== null) {
+        task.message = '正在更新索引…'
+        task.current = 'index.json'
+        try {
+          const marked = await this.markUploadedInIndex(indexFile.absolute, uploadedRelative)
+          trace.push({ index: 'updated', marked: marked })
+        } catch (e) {
+          trace.push({ index: 'update-failed', error: this.errText(e) })
+        }
+        task.message = '正在上传索引…'
+        try {
+          const indexSize = (await stat(indexFile.absolute)).size
+          const indexResult = await client.uploadFile({
+            filePath: indexFile.absolute,
+            path: joinRemote(paths.remotePath, 'index.json'),
+            size: indexSize,
+            ctime: Math.floor(indexFile.ctimeMs / 1000),
+            mtime: Math.floor(indexFile.mtimeMs / 1000)
+          })
+          if (indexResult.instant) instant += 1
+          uploadedRelative.add('index.json')
+          trace.push({
+            path: 'index.json',
+            size: indexSize,
+            instant: indexResult.instant === true,
+            uploadedSlices: indexResult.uploadedSlices,
+            precreate: indexResult.precreateResponse || null
+          })
+        } catch (e) {
+          failed.push({ path: 'index.json', error: this.errText(e) })
+          trace.push({ path: 'index.json', error: this.errText(e) })
+        }
+        done += 1
+        task.done = done
+      }
+
+      // ④ 删除云端多余的东西——「保持一致」的另一半，以前只有增改没有删。
+      //    只动 remotePath 之内的路径：那是用户明确指出归本插件管的地方。
+      const localSet = new Set(files.map((file) => file.relative))
+      const localDirs = new Set()
+      for (const file of files) {
+        const parts = file.relative.split('/')
+        for (let depth = 1; depth < parts.length; depth++) localDirs.add(parts.slice(0, depth).join('/'))
+      }
+      const extraDirs = remoteDirs.filter((relative) => !localDirs.has(relative))
+      const extraFiles = []
+      for (const relative of remoteFiles.keys()) {
+        if (localSet.has(relative)) continue
+        // 落在「整个目录都要删」的范围里就不必单独点名了：目录删除是递归的。
+        if (extraDirs.some((dir) => relative.startsWith(dir + '/'))) continue
+        extraFiles.push(relative)
+      }
+      const toDelete = extraDirs.concat(extraFiles).map((relative) => joinRemote(paths.remotePath, relative))
+      let deleted = 0
+      const deleteFailed = []
+      if (toDelete.length > 0) {
+        task.message = '正在清理云端多余内容…'
+        try {
+          const results = await client.deletePaths(toDelete)
+          for (const item of results) {
+            if (item.ok) deleted += 1
+            else deleteFailed.push({ path: item.path, error: 'errno=' + item.errno })
+          }
+          trace.push({ deleted: deleted, requested: toDelete.length, results: results.slice(0, 50) })
+        } catch (e) {
+          deleteFailed.push({ path: '(批量删除)', error: this.errText(e) })
+          trace.push({ deleteError: this.errText(e) })
+        }
+      }
+
+      // ⑤ 核对：云端必须与本地逐文件相同——一个不少，也一个不多。
+      task.message = '正在核对结果…'
+      let remoteFileCount = null
+      let missing = []
+      let extra = []
+      try {
+        const verifyEntries = await client.listAllEntries(paths.remotePath)
+        const present = new Set()
+        for (const entry of verifyEntries) {
+          if (Number(entry.isdir) === 1) continue
+          const relative = relativeTo(paths.remotePath, entry.path)
+          if (relative !== null && relative !== '') present.add(relative)
+        }
+        remoteFileCount = present.size
+        missing = files.filter((file) => !present.has(file.relative)).map((file) => file.relative)
+        extra = Array.from(present).filter((relative) => !localSet.has(relative))
+      } catch (e) {
+        trace.push({ verifyError: this.errText(e) })
+      }
+
+      task.result = {
+        uploaded: uploadedRelative.size - failed.length,
+        skipped: skippedNames.length,
+        skippedItems: skippedNames.slice(0, 20),
+        instant: instant,
+        deleted: deleted,
+        deletedItems: toDelete.slice(0, 20),
+        deleteFailed: deleteFailed.slice(0, 20),
+        failed: failed.length,
+        failedItems: failed.slice(0, 20),
+        total: files.length,
+        remotePath: paths.remotePath,
+        remoteFileCount: remoteFileCount,
+        missing: missing.slice(0, 20),
+        extra: extra.slice(0, 20)
+      }
+
+      const problems = []
+      if (failed.length > 0) problems.push('有 ' + failed.length + ' 个文件上传失败')
+      if (deleteFailed.length > 0) problems.push('有 ' + deleteFailed.length + ' 项删除失败')
+      if (missing.length > 0) problems.push('云端缺少 ' + missing.length + ' 个文件')
+      if (extra.length > 0) problems.push('云端多出 ' + extra.length + ' 个文件')
+      if (problems.length > 0) {
+        task.error = '同步后核对不通过：' + problems.join('、')
+      } else {
+        task.error = null
+        const config = await this.readBaiduConfig()
+        await this.writeBaiduConfig({ ...config, lastUploadAt: Date.now(), lastUploadPath: paths.remotePath })
+      }
+      this.baiduLocalCache = null
+    } catch (e) {
+      task.error = this.errText(e)
+      trace.push({ fatal: this.errText(e) })
+    } finally {
+      try {
+        await this.writeTextEnsured(
+          this.dshHomePath('session-migrate', 'baidu-debug.log'),
+          JSON.stringify({ at: new Date().toISOString(), kind: 'upload', remotePath: paths.remotePath, trace: trace }, null, 2)
+        )
+      } catch (e) {}
+      this.finishBaiduTask()
+    }
+  }
+
+  /**
+   * 把「这些文件已经成功传到云端了」写回本地 index.json。
+   *
+   * 只动 remoteHash 一个字段，其余原样保留——索引是导入的依据，不能因为上传
+   * 就把它整个重写一遍。返回被标记的条数。
+   */
+  async markUploadedInIndex(indexPath, uploadedRelative) {
+    if (uploadedRelative.size === 0) return 0
+    const index = JSON.parse(await this.fsReadText(indexPath))
+    const sessions = index !== null && typeof index === 'object' && Array.isArray(index.sessions)
+      ? index.sessions
+      : []
+    let marked = 0
+    for (const entry of sessions) {
+      if (entry === null || typeof entry !== 'object') continue
+      if (typeof entry.id !== 'string' || typeof entry.fileName !== 'string') continue
+      const relative = [
+        'sessions',
+        this.projSeg(entry.cwd === undefined ? null : entry.cwd),
+        this.encodeSegment(entry.id),
+        entry.fileName
+      ].join('/')
+      if (!uploadedRelative.has(relative)) continue
+      if (entry.remoteHash !== entry.hash) {
+        entry.remoteHash = typeof entry.hash === 'string' ? entry.hash : null
+        marked += 1
+      }
+    }
+    if (marked > 0) await this.fsWriteText(indexPath, JSON.stringify(index, null, 2))
+    return marked
+  }
+
+  async baiduDownload() {
+    if (this.baiduTask !== null && this.baiduTask.running) {
+      this.baiduLastError = '已经有一个同步任务在进行中，请等它结束'
+      return await this.baiduSnapshot()
+    }
+    const tokenState = await this.ensureBaiduToken()
+    if (!tokenState.ok) {
+      this.baiduLastError = this.baiduReasonText(tokenState)
+      return await this.baiduSnapshot()
+    }
+    const paths = await this.resolveBaiduPaths(tokenState.config)
+    if (!paths.ok) {
+      this.baiduLastError = paths.error
+      return await this.baiduSnapshot()
+    }
+    this.baiduLastError = null
+    this.beginBaiduTask('download', 0, '正在列出网盘文件…')
+    this.runBaiduDownload(paths).catch(() => {})
+    return await this.baiduSnapshot()
+  }
+
+  async runBaiduDownload(paths) {
+    const task = this.baiduTask
+    // 同上：凭证与客户端在 baiduDownload 里已经确认过。
+    const client = this.baidu
+    // 先落到一个临时目录，全部成功才替换本地 exports。
+    // 边下边覆盖的话，中途断网会留下"一半新一半旧"的备份——那比不更新更危险。
+    const incoming = this.dshHomePath('session-migrate', '.baidu-incoming')
+    const trace = []
+    try {
+      const listing = await client.listAllFiles(paths.remotePath)
+      const files = listing.filter((entry) => Number(entry.isdir) !== 1 && typeof entry.path === 'string')
+      // fs_id 是 64 位整数，调试日志里必须按字符串记，否则打印出来就已经是错的了。
+      trace.push({
+        step: 'list',
+        count: files.length,
+        sample: files.slice(0, 5).map((entry) => ({
+          fs_id: String(entry.fs_id),
+          fsIdType: typeof entry.fs_id,
+          path: entry.path,
+          size: entry.size
+        }))
+      })
+      if (files.length === 0) {
+        throw new Error('网盘目录 ' + paths.remotePath + ' 里没有任何文件')
+      }
+      const hasIndex = files.some((entry) => relativeTo(paths.remotePath, entry.path) === 'index.json')
+      if (!hasIndex) {
+        throw new Error('网盘目录里没有 index.json，这不像是本插件导出的备份')
+      }
+      task.total = files.length
+      task.message = '正在下载…'
+      await this.removePath(incoming)
+      await mkdir(incoming, { recursive: true })
+      const failed = []
+      let done = 0
+      for (const entry of files) {
+        const relative = relativeTo(paths.remotePath, entry.path)
+        if (relative === null || relative === '') {
+          done += 1
+          task.done = done
+          continue
+        }
+        task.current = relative
+        try {
+          const download = await client.openDownload(entry.fs_id)
+          const dest = join(incoming, ...relative.split('/'))
+          await mkdir(dirname(dest), { recursive: true })
+          await pipeline(Readable.fromWeb(download.response.body), createWriteStream(dest))
+        } catch (e) {
+          failed.push({ path: relative, error: this.errText(e) })
+          trace.push({
+            path: relative,
+            fs_id: String(entry.fs_id),
+            error: this.errText(e),
+            payload: e && e.payload ? e.payload : null
+          })
+        }
+        done += 1
+        task.done = done
+      }
+      if (failed.length > 0) {
+        task.result = {
+          downloaded: files.length - failed.length,
+          failed: failed.length,
+          failedItems: failed.slice(0, 20),
+          localPath: this.exportsLocalPath()
+        }
+        task.error = '有 ' + failed.length + ' 个文件没能下载，本地导出目录保持原样未改动'
+        return
+      }
+      const exportsBase = this.exportsLocalPath()
+      // 本地有、云端没有的东西要在替换时被清掉。先把它们点出来，好如实报告
+      // 「清理了多少」——不然用户只会看到数字变了，不知道消失的是什么。
+      const remoteRelative = new Set()
+      for (const entry of files) {
+        const relative = relativeTo(paths.remotePath, entry.path)
+        if (relative !== null && relative !== '') remoteRelative.add(relative)
+      }
+      let extraLocal = []
+      try {
+        const before = await this.scanLocalExportFiles()
+        extraLocal = before.filter((file) => !remoteRelative.has(file.relative)).map((file) => file.relative)
+      } catch (e) {}
+      await mkdir(exportsBase, { recursive: true })
+      // 「获取」的语义是本地完全以云端为准，所以连点文件一起清——
+      // 留下云端没有的东西就不叫一致了。
+      await this.clearDir(exportsBase, { keepDotFiles: false })
+      await this.moveTree(incoming, exportsBase)
+      this.baiduLocalCache = null
+      const config = await this.readBaiduConfig()
+      await this.writeBaiduConfig({ ...config, lastDownloadAt: Date.now() })
+      task.result = {
+        downloaded: files.length,
+        deleted: extraLocal.length,
+        deletedItems: extraLocal.slice(0, 20),
+        failed: 0,
+        failedItems: [],
+        localPath: exportsBase,
+        remotePath: paths.remotePath
+      }
+    } catch (e) {
+      task.error = this.errText(e)
+    } finally {
+      try { await this.removePath(incoming) } catch (e) {}
+      try {
+        await this.writeTextEnsured(
+          this.dshHomePath('session-migrate', 'baidu-debug.log'),
+          JSON.stringify({ at: new Date().toISOString(), kind: 'download', remotePath: paths.remotePath, trace: trace }, null, 2)
+        )
+      } catch (e) {}
+      this.finishBaiduTask()
+    }
+  }
+
+  async moveTree(src, dst) {
+    let entries = []
+    try {
+      entries = await readdir(src, { withFileTypes: true })
+    } catch (e) {
+      return
+    }
+    for (const entry of entries) {
+      const from = join(src, entry.name)
+      const to = join(dst, entry.name)
+      if (entry.isDirectory()) {
+        await mkdir(to, { recursive: true })
+        await this.moveTree(from, to)
+      } else if (entry.isFile()) {
+        await this.moveFile(from, to)
+      }
+    }
   }
 }
 
@@ -1447,4 +2582,8 @@ export async function apply(ctx) {
     service.reconcileMembership().catch(() => {})
   }, 4000)
   if (typeof timer.unref === 'function') timer.unref()
+  // 百度授权的轮询定时器要在插件卸载时停掉，否则它会拿着一个已经注销的服务继续跑。
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => () => { service.stopBaiduPolling() }, 'session-migrate: baidu polling')
+  }
 }

@@ -88,9 +88,32 @@ const legacyCwd = 'Z:\\AI\\legacy-from-another-machine'
 const checkCalls = []
 const applyCalls = []
 const importCalls = []
+const deleteCalls = []
+// 一个普通工作区：两个会话，一个已勾选、一个未勾选——删除入口只该出现在后者身上。
+const workCwd = 'D:\\work\\demo'
+const checkedId = 'session-checked'
+const uncheckedId = 'session-unchecked'
+const sessionRow = (id, title, archived) => ({
+  id, title, createdAt: 1, cwd: workCwd, parentSession: null,
+  live: false, persisted: true, status: 'none', size: 100, sizeDelta: null, archived: !!archived
+})
 const namespace = {
-  listGroups: async () => ({ ok: true, value: { groups: [], debug: '' } }),
-  loadSelection: async () => ({ ok: true, value: { selected: [] } }),
+  listGroups: async () => ({
+    ok: true,
+    value: {
+      groups: [{
+        key: workCwd, path: workCwd, title: 'demo', sessionCount: 2, archivedCount: 0,
+        sessionIds: [checkedId, uncheckedId], hasExport: false, status: 'none'
+      }],
+      debug: ''
+    }
+  }),
+  listSessions: async () => ({ ok: true, value: { sessions: [sessionRow(checkedId, '已勾选的会话'), sessionRow(uncheckedId, '未勾选的会话')] } }),
+  loadSelection: async () => ({ ok: true, value: { selected: [checkedId] } }),
+  deleteSession: async (id) => {
+    deleteCalls.push(id)
+    return { ok: true, value: { ok: true, id: id } }
+  },
   listUnlinkedGroups: async () => ({
     ok: true,
     value: {
@@ -235,4 +258,40 @@ assert.equal(importCalls.length, 1, '导入必须真的被调用')
 assert.ok(findText(tree, '有 2 个会话被跳过').length > 0, '跳过的数量必须显示出来')
 assert.ok(findText(tree, '找不到这个会话的日志文件').length > 0, '每个跳过条目都要给出原因')
 
-console.log('未关联工作区 UI 交互测试通过：输入、检测、应用、结果提示、导入跳过提示均正确。')
+// ── 会话行的删除入口：只在未勾选的会话上，且需要二次确认 ──────────────────────
+// 点击处理挂在行容器上（标题那个 span 自己没有 onClick），所以要找 sm-ws-row。
+const workRow = findNode(tree, (node) => {
+  if (!node.props || node.props.className !== 'sm-ws-row' || typeof node.props.onClick !== 'function') return false
+  return findText(node, 'demo').length > 0
+})[0]
+assert.ok(workRow, '应当列出普通工作区')
+workRow.props.onClick() // 展开该工作区，加载会话明细
+await tick()
+await tick()
+tree = await render()
+
+// 注：工作区行自己也有一个「删除」，所以不能按总数判断——按"按钮落在哪一行"来判断。
+const deleteButtonsIn = (row) => findNode(row, (node) => {
+  return node.type === 'button' && (node.children || []).filter((c) => typeof c === 'string').join('') === '删除'
+})
+const checkedRow = findNode(tree, (node) => (node.children || []).some((c) => c && c.props && c.props.title === '已勾选的会话'))[0]
+const uncheckedRow = findNode(tree, (node) => (node.children || []).some((c) => c && c.props && c.props.title === '未勾选的会话'))[0]
+assert.ok(checkedRow && uncheckedRow, '两行会话都要渲染出来')
+assert.equal(deleteButtonsIn(checkedRow).length, 0, '已勾选的会话不该有删除入口')
+assert.equal(deleteButtonsIn(uncheckedRow).length, 1, '未勾选的会话应当有删除入口')
+
+// 第一次点击只是"上膛"，不能真的删。
+deleteButtonsIn(uncheckedRow)[0].props.onClick({ stopPropagation: () => {} })
+await tick()
+tree = await render()
+assert.equal(deleteCalls.length, 0, '第一次点击不能立刻删除')
+assert.ok(findText(tree, '确认删除?').length > 0, '第一次点击应当变成确认态')
+
+// 第二次点击才真的删。
+findText(tree, '确认删除?')[0].props.onClick({ stopPropagation: () => {} })
+await tick()
+await tick()
+tree = await render()
+assert.deepEqual(deleteCalls, [uncheckedId], '确认后必须删除那个未勾选的会话')
+
+console.log('未关联工作区 UI 交互测试通过：输入、检测、应用、结果提示、导入跳过提示、会话删除入口均正确。')

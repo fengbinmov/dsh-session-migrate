@@ -8,7 +8,7 @@
     "./client": "./client.js"
   },
   "scripts": {
-    "test": "node tests/client-mount.smoke.mjs && node tests/client-relocation.smoke.mjs && node tests/host-remote.smoke.mjs"
+    "test": "node tests/client-mount.smoke.mjs && node tests/client-relocation.smoke.mjs && node tests/client-baidu.smoke.mjs && node tests/host-remote.smoke.mjs && node tests/baidu.smoke.mjs"
   },
   "dsh": {
     "bundle": {

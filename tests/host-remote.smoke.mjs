@@ -20,8 +20,9 @@ assert.equal(name, 'session-migrate')
 
 const expectedMethods = [
   'listGroups', 'listSessions', 'loadSelection', 'saveSelection',
-  'unarchive', 'deleteWorkspace', 'export', 'import',
-  'listUnlinkedGroups', 'checkRelocation', 'applyRelocation', 'reconcileMembership'
+  'unarchive', 'deleteWorkspace', 'deleteSession', 'export', 'import',
+  'listUnlinkedGroups', 'checkRelocation', 'applyRelocation', 'reconcileMembership',
+  'baiduStatus', 'baiduLoginStart', 'baiduLoginCancel', 'baiduLogout', 'baiduUpload', 'baiduDownload'
 ].sort()
 
 // 文件操作改走 node:fs 后，依赖只剩会话查询与工作区注册表（跨平台，不再需要 shell/fs 服务）。
@@ -42,12 +43,57 @@ const provided = new Map()
 const attached = []
 const createCalls = []
 const wsList = []
+// 复刻宿主的内部索引：会话 id → 它当前被认到的路径。
+// 宿主的 `sessionIds` 是个 getter，只保留"路径已知"的会话（`sessionPath(id) === 工作区路径`）。
+// 所以清了这张表却不重建，归属就会被静默过滤掉——表现就是工作区会话数变 0、
+// 导入后列表整片空白。这里把同样的语义搬过来，这类 bug 才会被测试挡住。
+const sessionPaths = new Map()
+// "正在对话的会话"：宿主对它们会跳过索引重建（见下面 readSessionHeader 替身）。
+const liveSessions = new Set()
+// 手工登记一个工作区（连同它名下的会话在宿主索引里的路径）。
+function registerWorkspace(path, sessionIds, title) {
+  const ids = (sessionIds || []).map(String)
+  wsList.push({ path, title: title || path, sessionIds: ids.slice() })
+  for (const id of ids) sessionPaths.set(id, path)
+}
 // 工作区注册表替身：create() 像真实实现那样要求路径是已存在的目录
 // （真实实现走 realpathNormalize + stat().isDirectory()），
 // 这样"目标机器上还没有这个工作区目录"的分支才会被真正走到。
 const workspaceRegistry = {
   archivedSessionIds: [],
-  list: () => wsList,
+  headers: new Map(),
+  sessionPaths: sessionPaths,
+  invalidSessionPaths: new Map(),
+  list: () => wsList.map((record) => ({
+    path: record.path,
+    title: record.title,
+    // 与宿主一致的过滤语义：路径认不出来的会话不算这个工作区的。
+    get sessionIds() {
+      return record.sessionIds.filter((id) => sessionPaths.get(String(id)) === record.path)
+    },
+    // 宿主摘除会话时只动 record.sessionIds（不动 sessionPaths），这里照做。
+    detachSession: async (id) => {
+      record.sessionIds = record.sessionIds.filter((sid) => String(sid) !== String(id))
+    }
+  })),
+  // 宿主在缓存未命中时会全量重扫一遍会话，并把结果写回索引。
+  // 但**活跃会话**（正在对话的那个）例外：它会先从 live 会话取 header 并直接返回，
+  // 根本不会重建 sessionPaths。所以"清掉索引等它重建"对活跃会话无效——它永远认不出
+  // 路径，被 sessionIds getter 过滤掉，在侧栏里掉进「未分组」。
+  async readSessionHeader(id) {
+    const key = String(id)
+    if (liveSessions.has(key)) {
+      const record = sessions.get(key)
+      const cwd = record && record.header ? record.header.cwd : null
+      return { id: id, cwd: cwd === undefined ? null : cwd }
+    }
+    sessionPaths.clear()
+    for (const [sessionId, record] of sessions) {
+      const cwd = record && record.header ? record.header.cwd : null
+      sessionPaths.set(String(sessionId), cwd === undefined ? null : cwd)
+    }
+    return { id: id, cwd: sessionPaths.has(key) ? sessionPaths.get(key) : null }
+  },
   create: async (path) => {
     const info = await stat(path).catch(() => null)
     if (info === null || !info.isDirectory()) {
@@ -62,6 +108,8 @@ const workspaceRegistry = {
     return {
       attachSession: async (id) => {
         attached.push(id)
+        const record = wsList.find((entry) => entry.path === path)
+        if (record !== undefined && !record.sessionIds.includes(id)) record.sessionIds.push(id)
       }
     }
   }
@@ -77,7 +125,25 @@ const ctx = {
   },
   get: (key) => {
     if (key === 'dshHomePath') return (...segments) => join(homeDir, ...segments)
-    if (key === 'sessionQuery') return { listSessions: async () => [...sessions.values()] }
+    if (key === 'sessionQuery') {
+      // 会话查询替身：按 cwd 过滤。它代表宿主的派生索引，**只反映已登记的会话**，
+      // 不负责发现"磁盘上已经被删掉的"——那正是被测代码要自己处理的情形。
+      const cwdOf = (record) => {
+        const cwd = record && record.header ? record.header.cwd : null
+        return cwd === undefined ? null : cwd
+      }
+      return {
+        listSessions: async () => [...sessions.values()],
+        filterSessions: async (filters) => {
+          const wanted = filters && filters[0] && filters[0].kind === 'cwd' ? filters[0].values[0] : undefined
+          return [...sessions.entries()]
+            .filter(([, record]) => cwdOf(record) === wanted)
+            .map(([, record]) => ({ header: record.header }))
+        },
+        readTitleSnapshots: async (ids) => ids.map(() => ({ status: 'fulfilled', value: null })),
+        readSession: async () => null
+      }
+    }
     if (key === 'workspaceRegistry') return workspaceRegistry
     return undefined
   }
@@ -394,6 +460,141 @@ if (selectionBackup !== null) {
   await service.writeTextEnsured(selectionSnapshotPath, selectionBackup)
 }
 
+// ── 删除单个会话：和工作区删除是同一套动作，只是范围缩小到一个会话 ────────────
+// 本段要改写 selection.json（验证"从勾选里摘掉"），结束时还原，免得影响后面的用例。
+const delSelectionBackup = await service.fsExists(selectionSnapshotPath)
+  ? await service.fsReadText(selectionSnapshotPath)
+  : null
+const delCwd = join(homeDir, 'delete-ws')
+mkdirSync(delCwd, { recursive: true })
+const delId = 'session-probe-delete'
+const delFile = join(homeDir, 'sessions', service.projSeg(delCwd), delId, 'session.v3.jsonl.zstd')
+// 必须是合法的压缩日志：deleteSession 靠读磁盘 header 定位（查询服务看不到的也要能删）。
+await service.writeTextEnsured(
+  delFile,
+  zstdCompressSync(Buffer.from(JSON.stringify({ type: 'session', version: 3, id: delId, cwd: delCwd }) + '\n'))
+)
+sessions.set(delId, { header: { id: delId, cwd: delCwd } })
+registerWorkspace(delCwd, [delId], 'delete-ws')
+await service.saveSelection([delId])
+const delCache = join(homeDir, 'storages', 'session_projcache', 'sessions', delId + '.json')
+await service.writeTextEnsured(delCache, 'CACHE')
+assert.equal(await service.fsExists(delFile), true, '前置条件：会话文件存在')
+
+const delResult = await service.deleteSession(delId)
+assert.equal(delResult.ok, true, '删除应当成功')
+assert.equal(await service.fsExists(delFile), false, '会话日志必须被删除')
+assert.equal(await service.fsExists(delCache), false, '投影缓存必须被删除')
+assert.equal(
+  wsList.some((ws) => ws.path === delCwd && ws.sessionIds.includes(delId)),
+  false,
+  '必须从工作区归属里摘掉'
+)
+const selectionAfterDelete = await service.loadSelection()
+assert.equal(selectionAfterDelete.selected.includes(delId), false, '必须从勾选记录里去掉')
+// 项目目录空了就顺手收掉，不留空壳。
+assert.equal(await service.fsExists(join(homeDir, 'sessions', service.projSeg(delCwd))), false, '空的项目目录应当被收掉')
+// 删不存在的会话要如实报错，而不是假装成功。
+const missingDelete = await service.deleteSession('session-never-existed')
+assert.ok(missingDelete.error, '删除不存在的会话应当返回 error')
+
+// ── 索引不同步时也必须把归属摘干净 ────────────────────────────────────────────
+// 回归：删除时如果拿 sessionIds getter 过滤后的集合判断"要不要摘"，一旦索引不同步
+// （宿主重建过索引、或文件已被先删掉），那个集合里就没有这个 id，判断失灵，
+// record.sessionIds 上的归属会永远留着——会话随后就以"cwd 认不出来"的形态漂到
+// 「无工作区会话」里，看起来像"删掉的会话又冒出来了"。
+const lostCwd = join(homeDir, 'lost-ws')
+mkdirSync(lostCwd, { recursive: true })
+const lostId = 'session-probe-lost'
+const lostFile = join(homeDir, 'sessions', service.projSeg(lostCwd), lostId, 'session.v3.jsonl.zstd')
+await service.writeTextEnsured(
+  lostFile,
+  zstdCompressSync(Buffer.from(JSON.stringify({ type: 'session', version: 3, id: lostId, cwd: lostCwd }) + '\n'))
+)
+sessions.set(lostId, { header: { id: lostId, cwd: lostCwd } })
+registerWorkspace(lostCwd, [lostId], 'lost-ws')
+// 模拟"宿主重建过索引，而这个会话没被认出来"：归属还在 record 上，索引里却没有它。
+sessionPaths.delete(lostId)
+const lostStillOwned = () => wsList.find((ws) => ws.path === lostCwd).sessionIds.includes(lostId)
+assert.equal(lostStillOwned(), true, '前置条件：归属挂在 record 上')
+
+await service.deleteSession(lostId)
+assert.equal(lostStillOwned(), false, '索引不同步时也必须把工作区归属摘掉')
+assert.equal(await service.fsExists(lostFile), false, '日志同样要删掉')
+
+// ── 活跃会话（正在对话的那个）也必须保住工作区归属 ────────────────────────────
+// 回归：宿主对活跃会话会走 readSessionHeader 的 live 分支直接返回 header，
+// **不会**重建 sessionPaths。所以"清掉索引等它重建"对它无效——sessionPaths 会永远
+// 空着，它被 sessionIds getter 过滤掉，在侧栏里以"路径不认识"的形态掉进「未分组」。
+// 正确做法是直接把索引表写成实际位置。
+const liveCwd = join(homeDir, 'live-ws')
+mkdirSync(liveCwd, { recursive: true })
+const liveId = 'session-probe-live'
+const liveProbeFile = join(homeDir, 'sessions', service.projSeg(liveCwd), liveId, 'session.v3.jsonl.zstd')
+await service.writeTextEnsured(
+  liveProbeFile,
+  zstdCompressSync(Buffer.from(JSON.stringify({ type: 'session', version: 3, id: liveId, cwd: liveCwd }) + '\n'))
+)
+sessions.set(liveId, { header: { id: liveId, cwd: liveCwd } })
+liveSessions.add(liveId) // 标记成"正在对话的那个"
+registerWorkspace(liveCwd, [liveId], 'live-ws')
+sessionPaths.delete(liveId) // 索引里暂时没有它
+
+const liveExportDir = join(homeDir, 'live-export')
+await service.writeTextEnsured(
+  join(liveExportDir, 'sessions', service.projSeg(liveCwd), liveId, 'session.v3.jsonl.zstd'), 'LIVE'
+)
+await service.writeTextEnsured(join(liveExportDir, 'index.json'), JSON.stringify({
+  format: 'dsh-sessions-export',
+  version: 3,
+  exportedAt: 1,
+  sessions: [{ id: liveId, cwd: liveCwd, fileName: 'session.v3.jsonl.zstd', hash: null, fingerprint: null, archived: false }]
+}))
+await service.import(liveExportDir)
+// 用 list() 返回的对象（走 sessionIds getter）来断言，这才等价于侧栏看到的东西。
+const liveWs = service.workspaceRegistry.list().find((ws) => ws.path === liveCwd)
+assert.ok(liveWs, '工作区应当还在')
+assert.equal(
+  Array.from(liveWs.sessionIds).includes(liveId),
+  true,
+  '活跃会话也必须保住归属——宿主不会为它重建索引，所以必须直接写索引表'
+)
+
+// ── 查询索引里残留的会话不能出现在列表里 ──────────────────────────────────────
+// 回归：宿主的会话查询是 SQLite 派生索引，只在**搜索**时与持久化对账；删掉日志文件后
+// listSessions / filterSessions 仍会把它返回，面板上就是"删了还在"。
+async function assertGhostHidden(label) {
+  const ghostCwd = join(homeDir, 'ghost-ws')
+  mkdirSync(ghostCwd, { recursive: true })
+  const ghostId = 'session-probe-query-ghost'
+  // 查询服务"看得见"它，但磁盘上没有它的日志文件。
+  sessions.set(ghostId, { header: { id: ghostId, cwd: ghostCwd } })
+  registerWorkspace(ghostCwd, [ghostId], 'ghost-ws')
+  assert.equal(
+    await service.fsExists(join(homeDir, 'sessions', service.projSeg(ghostCwd), ghostId, 'session.v3.jsonl.zstd')),
+    false,
+    '前置条件：磁盘上确实没有它'
+  )
+  const listed = await service.listSessions(ghostCwd)
+  assert.equal(listed.sessions.length, 0, label + '：幽灵会话不能出现在会话列表里')
+}
+await assertGhostHidden('listSessions')
+
+// 无工作区那一路（cwd 为 null）同样要过滤。
+const ghostOrphanId = 'session-probe-orphan-ghost'
+sessions.set(ghostOrphanId, { header: { id: ghostOrphanId, cwd: null } })
+const ghostGroups = await service.listGroups()
+const orphanGroup = ghostGroups.groups.find((group) => group.key === '__orphan__')
+assert.equal(
+  orphanGroup === undefined || !orphanGroup.sessionIds.includes(ghostOrphanId),
+  true,
+  '幽灵的无工作区会话也不能进入分组'
+)
+
+if (delSelectionBackup !== null) {
+  await service.writeTextEnsured(selectionSnapshotPath, delSelectionBackup)
+}
+
 // 会话带 cwd，而目标机器上这个工作区目录还不存在：必须先补建目录，再注册归属。
 const wsCwd = join(homeDir, 'fresh-workspace')
 const wsProject = service.projSeg(wsCwd)
@@ -495,12 +696,14 @@ assert.equal(
 // ── 导出索引只保留"不可派生"的字段 ────────────────────────────────────────────
 // sessionSegment 对 session-<uuid> 恒等于 id；relativePath 由 projectDir + 段 + 文件名
 // 拼得出来；createdAt 等元数据会话 header 里本来就有。这些都不该再抄一遍。
-assert.equal(exportedIndex.version, 3, '导出索引格式版本应为 3')
+assert.equal(exportedIndex.version, 4, '导出索引格式版本应为 4')
 assert.deepEqual(
   Object.keys(exportedIndex.sessions[0]).sort(),
-  ['archived', 'cwd', 'fileName', 'fingerprint', 'hash', 'id'],
+  ['archived', 'cwd', 'fileName', 'fingerprint', 'hash', 'id', 'remoteHash'],
   '索引只写不可派生的字段（目录名一律现算）'
 )
+// remoteHash 记的是「云端那份内容的 hash」；刚导出、还没上传过，所以是 null。
+assert.equal(exportedIndex.sessions[0].remoteHash, null, '没上传过时 remoteHash 应为 null')
 
 // v3 索引没有 sessionSegment / relativePath，导入时必须能自己算出落位。
 const roundTripFile = join(homeDir, 'sessions', '_no-cwd', goodId, 'session.v3.jsonl.zstd')
@@ -538,16 +741,17 @@ await service.writeTextEnsured(join(exportDir, 'index.json'), JSON.stringify({
 // 注册表顺序刻意打乱：未导出的一头一尾、组内字母倒序——这样两级排序都必须真的
 // 生效才能得到期望结果，不会因为"碰巧原顺序就对"而蒙混过关。
 wsList.length = 0 // 前面的归属恢复测试也会注册工作区，这里只留本用例要验证的四个
-wsList.push(
-  { path: wsNoneB, title: 'none-b', sessionIds: [] },
-  { path: wsExpZeta, title: 'zeta-exported', sessionIds: [sortIdB] },
-  { path: wsNoneA, title: 'none-a', sessionIds: [] },
-  { path: wsExpAlpha, title: 'alpha-exported', sessionIds: [sortIdA] }
-)
+sessionPaths.clear()
+registerWorkspace(wsNoneB, [], 'none-b')
+registerWorkspace(wsExpZeta, [sortIdB], 'zeta-exported')
+registerWorkspace(wsNoneA, [], 'none-a')
+registerWorkspace(wsExpAlpha, [sortIdA], 'alpha-exported')
 const groupsResult = await service.listGroups()
+// 前面的用例在查询替身里留下了 cwd 为 null 的会话，所以还会有一个「无工作区会话」组：
+// 它没有导出记录（hasExport=false）所以沉到未导出一档，名称按字母序排在 none-a 之前。
 assert.deepEqual(
   groupsResult.groups.map((group) => group.title),
-  ['alpha-exported', 'zeta-exported', 'none-a', 'none-b'],
+  ['alpha-exported', 'zeta-exported', '无工作区会话', 'none-a', 'none-b'],
   '未导出的整组沉底，同类内部按名称字母排序'
 )
 
@@ -635,7 +839,55 @@ assert.equal(
   '重定位后不应再出现在未关联里'
 )
 
+// ── 导入之后状态必须重新变干净 ────────────────────────────────────────────────
+// 回归：用户从备份导入后，工作区列表却显示「有变化」。但那是转手的副作用——
+// 文件经过「导出 → 上传云端 → 从云端下载」之后，时间戳已经不是导出那一刻的了；
+// 导入把它拷回工作区，带的是新的时间戳，与索引里记的 fingerprint 对不上，
+// 而那显然不是用户的改动。导入完成后要把新版本回写索引。
+{
+  const wsPath = join(homeDir, 'import-freshness-ws')
+  mkdirSync(wsPath, { recursive: true })
+  const freshId = 'session-import-freshness'
+  const freshProj = service.projSeg(wsPath)
+  const freshFile = join(homeDir, 'sessions', freshProj, freshId, 'session.v3.jsonl.zstd')
+  const freshBackup = join(exportDir, 'sessions', freshProj, freshId, 'session.v3.jsonl.zstd')
+  await service.writeTextEnsured(freshFile, 'CONTENT-V1')
+  // export 是拿「会话查询服务里的记录」来定位文件的，替身里也得登记这一条。
+  sessions.set(freshId, { header: { id: freshId, cwd: wsPath } })
+
+  wsList.length = 0
+  sessionPaths.clear()
+  registerWorkspace(wsPath, [freshId], 'import-freshness')
+
+  await service.export([freshId])
+  let freshGroups = await service.listGroups()
+  let freshGroup = freshGroups.groups.find((group) => group.path === wsPath)
+  assert.equal(freshGroup.status, 'unchanged', '刚导出完应当是无变化')
+
+  // 模拟「上传到云端 → 从云端下载」这一段：exports 里的文件会被重新写过，
+  // 时间戳不再是导出那一刻的。内容一个字没变，但文件版本变了——
+  // 这正是用户导入后看到「有变化」的真实来路。
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  await service.writeTextEnsured(freshBackup, 'CONTENT-V1')
+
+  // 导入：文件被拷回工作区，带着那份新的时间戳。不对齐的话，状态会是「有变化」。
+  const freshResult = await service.import()
+  assert.ok(freshResult.realigned >= 1, '导入后应当把新文件版本回写到索引')
+  freshGroups = await service.listGroups()
+  freshGroup = freshGroups.groups.find((group) => group.path === wsPath)
+  assert.equal(freshGroup.status, 'unchanged', '导入之后应当显示无变化，而不是「有变化」')
+
+  // 集合不同仍然算「有变化」——导入不删除工作区里备份之外的东西。
+  wsList[0].sessionIds.push('session-extra-not-in-backup')
+  // 宿主的 sessionIds getter 只认索引里登记过的会话；同步登记，否则它会被过滤掉，
+  // 测到的就不是"工作区多出一个会话"了。
+  sessionPaths.set('session-extra-not-in-backup', wsPath)
+  freshGroups = await service.listGroups()
+  freshGroup = freshGroups.groups.find((group) => group.path === wsPath)
+  assert.equal(freshGroup.status, 'changed', '工作区多出备份里没有的会话时，仍然是有变化')
+}
+
 rmSync(homeDir, { recursive: true, force: true })
 
-console.log('host 装配冒烟测试通过：服务注册、字符串键标记、文件层契约、导入覆盖语义、配置清理、工作区排序均符合宿主要求。')
+console.log('host 装配冒烟测试通过：服务注册、字符串键标记、文件层契约、导入覆盖语义、配置清理、工作区排序、导入后状态自洽均符合宿主要求。')
 
