@@ -104,7 +104,7 @@ const POST_QUERY_KEYS = new Set(['method', 'access_token'])
 
 // 网盘上的默认落点（相对于应用的 /apps/<应用名>/ 目录）。
 //
-// 落点本身是可配的，写在 panbaidu.json 的 RemotePath 字段里。这里只是一份兜底，
+// 落点本身是可配的，写在 baiduclound.json 的 RemotePath 字段里。这里只是一份兜底，
 // 让没配过的人也能直接用。RemotePath 支持两种写法：
 //   - 相对路径 `AI/exports` —— 拼在应用目录后面，不必关心应用叫什么名字
 //   - 绝对路径 `/apps/dsh/AI/exports` —— 直接指定，连应用目录都不用再去探测

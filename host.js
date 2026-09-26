@@ -76,7 +76,7 @@ const ORPHAN_KEY = '__orphan__'
 
 // 百度网盘应用凭证的文件名（放在 $DSH_HOME/session-migrate/ 下）。
 // 这个文件由用户自己维护，插件只读不写——凭证是私密信息，不该由代码生成或覆盖。
-const BAIDU_CREDENTIALS_FILE = 'panbaidu.json'
+const BAIDU_CREDENTIALS_FILE = 'baiduclound.json'
 
 // 归组时读不出 cwd 的会话先落到这一组（等下次读得出来再归位），
 // 绝不因为读不出 header 就把用户的勾选丢掉。
@@ -144,7 +144,7 @@ class SessionMigrateService {
     this.baiduRefreshFailedAt = 0
     this.baiduTask = null
     this.baiduLocalCache = null
-    // 建客户端时用的凭证指纹：用户改了 panbaidu.json 就靠它发现并重建。
+    // 建客户端时用的凭证指纹：用户改了 baiduclound.json 就靠它发现并重建。
     this.baiduCredentialsKey = null
     this.typertRemote = Object.freeze({
       service: this,
@@ -1627,7 +1627,7 @@ class SessionMigrateService {
     return this.dshHomePath('session-migrate', 'baidu.json')
   }
 
-  panbaiduConfigPath() {
+  baiduCredentialsPath() {
     if (typeof this.dshHomePath !== 'function') return undefined
     return this.dshHomePath('session-migrate', BAIDU_CREDENTIALS_FILE)
   }
@@ -1642,7 +1642,7 @@ class SessionMigrateService {
    * 要让他去看格式，「缺字段」要指出缺哪个。笼统报一句「凭证有问题」帮不上忙。
    */
   async readBaiduCredentials() {
-    const path = this.panbaiduConfigPath()
+    const path = this.baiduCredentialsPath()
     if (path === undefined) return { ok: false, reason: 'unavailable', path: null }
     let raw
     try {
@@ -1762,7 +1762,7 @@ class SessionMigrateService {
   /**
    * 确定网盘落点。
    *
-   * 落点来自 `panbaidu.json` 的 `RemotePath`，两种写法都支持：
+   * 落点来自 `baiduclound.json` 的 `RemotePath`，两种写法都支持：
    *   - 绝对路径（`/apps/dsh/AI/exports`）：用户已经把话说明白了，不必再探测应用目录
    *   - 相对路径（`AI/exports`）：拼在应用目录后面；应用名只有列一次 /apps 才知道，
    *     探到就记进 baidu.json 复用，下次不必再探
@@ -1782,7 +1782,7 @@ class SessionMigrateService {
       if (segments.length < 3 || segments[0] !== 'apps') {
         return {
           ok: false,
-          error: 'panbaidu.json 里的 RemotePath 必须是 /apps/<应用名>/... 形式的绝对路径，当前是 ' + configured
+          error: 'baiduclound.json 里的 RemotePath 必须是 /apps/<应用名>/... 形式的绝对路径，当前是 ' + configured
         }
       }
       const appRoot = '/' + segments[0] + '/' + segments[1]
@@ -1931,7 +1931,7 @@ class SessionMigrateService {
     return {
       available: this.baiduConfigPath() !== undefined,
       configured: credentialState.ok,
-      credentialsPath: this.panbaiduConfigPath() || null,
+      credentialsPath: this.baiduCredentialsPath() || null,
       credentialsProblem: credentialState.ok ? null : {
         reason: credentialState.reason,
         message: this.baiduReasonText(credentialState)
@@ -1948,7 +1948,7 @@ class SessionMigrateService {
       account: config.account || null,
       appRoot: appRoot,
       subdir: subdir,
-      // 落点是写死的默认值，还是用户在 panbaidu.json 里配的？面板要把这个说清楚，
+      // 落点是写死的默认值，还是用户在 baiduclound.json 里配的？面板要把这个说清楚，
       // 否则用户改了配置却看到「没变化」，会以为配置没生效。
       remotePathSource: configured !== '' ? 'configured' : 'default',
       remotePath: remotePath,
@@ -2052,7 +2052,7 @@ class SessionMigrateService {
       }
       inFlight = true
       try {
-        // 每次轮询都重新确认凭证：用户可能在等待授权期间把 panbaidu.json 删了或改了。
+        // 每次轮询都重新确认凭证：用户可能在等待授权期间把 baiduclound.json 删了或改了。
         const ready = await this.baiduClientReady()
         if (!ready.ok) {
           this.baiduPending = null

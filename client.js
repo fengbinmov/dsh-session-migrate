@@ -566,7 +566,7 @@ window.__ModuleLoader__.load({
             return h('div', { className: 'sm-baidu-box' }, [
               h('div', { className: 'sm-err' }, problem.message || '还没有配置百度网盘应用凭证'),
               h('div', { className: 'sm-hint' }, '把应用凭证写进下面这个文件（插件只读，不会生成或覆盖它）：'),
-              h('div', { className: 'sm-kv' }, baidu.credentialsPath || 'panbaidu.json'),
+              h('div', { className: 'sm-kv' }, baidu.credentialsPath || 'baiduclound.json'),
               h('pre', { className: 'sm-code' }, [
                 '{',
                 '  "appId": "应用 ID",',
@@ -589,8 +589,8 @@ window.__ModuleLoader__.load({
           rows.push(h('div', { key: 'remote', className: 'sm-kv' },
             '网盘位置：' + (baidu.remotePath || '（登录后自动探测）')
             + (baidu.remotePathSource === 'configured'
-              ? '（来自 panbaidu.json 的 RemotePath）'
-              : '（默认值，可在 panbaidu.json 里用 RemotePath 改）')))
+              ? '（来自 baiduclound.json 的 RemotePath）'
+              : '（默认值，可在 baiduclound.json 里用 RemotePath 改）')))
           rows.push(h('div', { key: 'local', className: 'sm-kv' },
             '本地位置：' + (baidu.localPath || '未知')
             + (baidu.local && baidu.local.exists

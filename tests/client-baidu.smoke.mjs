@@ -106,9 +106,9 @@ const remotePath = '/apps/myapp/AI/exports'
 function baseState() {
   return {
     available: true,
-    // 凭证来自用户自己维护的 panbaidu.json；协议层与宿主都没有内置默认值。
+    // 凭证来自用户自己维护的 baiduclound.json；协议层与宿主都没有内置默认值。
     configured: true,
-    credentialsPath: 'C:\\Users\\me\\.dsh\\session-migrate\\panbaidu.json',
+    credentialsPath: 'C:\\Users\\me\\.dsh\\session-migrate\\baiduclound.json',
     credentialsProblem: null,
     loggedIn: false,
     phase: 'idle',
@@ -242,12 +242,12 @@ state = {
   configured: false,
   credentialsProblem: {
     reason: 'missing',
-    message: '还没有配置百度网盘应用凭证：请创建 ' + 'C:\\Users\\me\\.dsh\\session-migrate\\panbaidu.json'
+    message: '还没有配置百度网盘应用凭证：请创建 ' + 'C:\\Users\\me\\.dsh\\session-migrate\\baiduclound.json'
   }
 }
 let tree = await render()
 assert.ok(findText(tree, '还没有配置百度网盘应用凭证').length > 0, '缺凭证时必须说明白')
-assert.ok(findText(tree, 'panbaidu.json').length > 0, '必须把期望的文件路径显示出来')
+assert.ok(findText(tree, 'baiduclound.json').length > 0, '必须把期望的文件路径显示出来')
 assert.ok(findText(tree, 'secretKey').length > 0, '必须给出文件格式模板')
 assert.equal(findButton(tree, '登录百度网盘'), undefined, '缺凭证时不该出现登录按钮')
 assert.equal(findButton(tree, '上传到百度云'), undefined, '缺凭证时不该出现同步按钮')

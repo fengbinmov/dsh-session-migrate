@@ -254,7 +254,7 @@ const TEST_CREDENTIALS = {
   )
 }
 
-// ── 网盘落点：从 panbaidu.json 的 RemotePath 读，不写死在代码里 ────────────────
+// ── 网盘落点：从 baiduclound.json 的 RemotePath 读，不写死在代码里 ────────────────
 {
   // 没配就是空串，调用方回退到默认值。
   assert.equal(normalizeRemotePath({}), '')
@@ -734,7 +734,7 @@ const TEST_CREDENTIALS = {
   }))
   writeFileSync(join(sessionDir, 'session.v3.jsonl.zstd'), 'SESSION-BYTES')
   mkdirSync(join(home, 'session-migrate'), { recursive: true })
-  const credentialsPath = join(home, 'session-migrate', 'panbaidu.json')
+  const credentialsPath = join(home, 'session-migrate', 'baiduclound.json')
   const statePath = join(home, 'session-migrate', 'baidu.json')
   // 登录态（token）与应用凭证是两个文件：前者插件自己维护，后者只由用户维护。
   const signedIn = JSON.stringify({
@@ -788,7 +788,7 @@ const TEST_CREDENTIALS = {
   const service = provided.get('sessionMigrate')
   assert.ok(service, 'sessionMigrate 服务未注册')
 
-  // ── 凭证只从 panbaidu.json 读 ────────────────────────────────────────────────
+  // ── 凭证只从 baiduclound.json 读 ────────────────────────────────────────────────
   // 文件不存在：明确说「还没配置」，并且一个网络请求都不该发出去。
   writeFileSync(statePath, signedIn)
   const noCreds = await service.baiduUpload()
@@ -886,7 +886,7 @@ const TEST_CREDENTIALS = {
     assert.equal(debugLog.trace[0].precreate.uploadid, 'UP-E', '要把 precreate 的原始响应记下来')
   }
 
-  // ── 落点可配：panbaidu.json 里的 RemotePath 说了算 ──────────────────────────
+  // ── 落点可配：baiduclound.json 里的 RemotePath 说了算 ──────────────────────────
   {
     const uploads = []
     const pathFetch = fakeFetch(async (call) => {
